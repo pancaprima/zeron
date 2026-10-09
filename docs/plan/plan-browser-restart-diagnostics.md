@@ -95,6 +95,54 @@ Source: `/root/.hermes/profiles/girlfriend/cache/scratch/zeron-browser-windows-f
 - If native store empty on verify — WebKit persistent cookie backing for identifier-based stores (may need architecture proposal).
 - WebKit persistent store correctness across process restart — not proven by unit tests alone.
 
+## Opus 5.5 second opinion (2026-10-09) and decisive experiments
+
+Source: `zeron-opus55-medium-cookie-second-opinion.json` (code + public WebKit `main`/Wry v0.56.1 source reading; nothing native ran; runner WebKit may be older than `main`).
+
+### Correction
+
+`-[WKHTTPCookieStore getAllCookies:]` is an **in-memory read**, and so is the JS probe. `present=1` before exit therefore **does not prove the cookie was never written to disk**, nor that it was. The earlier "loss, not flush" reading is withdrawn: "never written" and "written then lost / not loaded" both remain open until on-disk evidence exists.
+
+### Facts from code
+
+- `isPersistent=true` describes the store, not the cookie; the cookie's own session-only flag and expiry were never logged.
+- Probe cookie: `path=/; max-age=31536000`, no `Secure`/`HttpOnly`, plain HTTP on `127.0.0.1` (`persistence_probe.rs`).
+- Store is ours: `macos.rs:108-111` `dataStoreForIdentifier`, `macos.rs:140-145` `setWebsiteDataStore`; Wry keeps an injected configuration's store.
+- `scripts/run-macos-browser-fixture.sh:7` uses a fresh `mktemp` bundle path per phase, but `:13` a fixed `CFBundleIdentifier sh.zeron.browser-fixture`. WebKit keys storage by bundle id: `~/Library/WebKit/<bundle-id>/WebsiteDataStore/<UUID>/`, cookies at `Cookies/Cookies.binarycookies`.
+- Per-profile `webkit-data` / `webkit-cache` dirs (`profile.rs`) are unused on macOS.
+- Shutdown order (`persistence_harness.rs:682-685`): `drop(state)`, `remove_window()` (drops `Shell` → browser context → store reference), 100 ms, `quit` → `-[NSApp terminate:]`.
+- WebKit teardown (source reading): releasing the store sends `DestroySession`; `NetworkProcess::destroySession` closes the storage manager (saves localStorage) but does **not** call `platformFlushCookies`. Only the connection-closed path flushes cookies, and only for sessions that still exist. The only explicit flush is private `_flushCookiesToDiskWithCompletionHandler:`.
+
+### Ranked hypotheses
+
+1. **High** — store released before exit destroys the network session without saving cookies (fits localStorage-survives / cookie-lost). *Falsified if* the cookie name is already in `Cookies.binarycookies` after `relaunch-write`, or no `destroySession` for the store UUID precedes exit.
+2. **Medium-low** — cookie reaches disk but is not loaded back for IP-literal host `127.0.0.1`. *Falsified if* the name is on disk and a `localhost` A/B behaves the same.
+3. **Low** — cookie classified session-only (e.g. tracking prevention). *Falsified by* `session_only=0 has_expiry=1` in the native diag line.
+4. **Very low** — storage location changes between phases (bundle id constant; localStorage survives).
+5. **Very low** — wrong store injected.
+
+### Experiments implemented (fixture/CI only; no production change)
+
+| # | Where | What it records |
+|---|-------|-----------------|
+| 1 | `scripts/ci/run-macos-browser-persistence-fixture.sh` (after the `relaunch-write` process has **exited**, before `relaunch-verify` starts; again on verify failure) | `sw_vers`, WebKit `CFBundleVersion`, Safari version; existence/size/mtime of bundle dir, `WebsiteDataStore/<UUID>/`, `Cookies/Cookies.binarycookies`, `LocalStorage`, `Origins`; entries of the fixed fixture `<UUID>` subtree only (depth 3, names/size/mtime, capped at 60 lines); **cookie name match count only** in the cookie file, never values. UUID read from marker `profileDiag` `store_uuid=`; absent paths print `absent`. Metadata only (no log capture) so writer-exit → verifier timing is unchanged. Never fails the job. |
+| 2 | `crates/ui/src/browser/macos_persistence_diag.rs` | Existing async `getAllCookies` line gains `matches=N session_only=0\|1 has_expiry=0\|1` (`na` when absent). No values; same oneshot + bounded GPUI timer; no runloop pumping or `Drop` work. |
+| 3 | Same script, **only after `relaunch-verify` finished** (success, or failure via the EXIT trap) | `log show --info --predicate 'subsystem == "com.apple.WebKit"'` from `relaunch-write` start (covers writer teardown), under a 60 s `perl alarm`; full output in `$RUNNER_TEMP/browser-captures-persistence-evidence/` (caught by the existing `browser-captures*` upload glob; no workflow edit), filtered `destroySession` / `~WebsiteDataStore` / closed-connection / flush lines echoed to the job log. The EXIT trap saves and re-exits with the original status, so evidence can never turn a pass into a failure or vice versa. |
+
+Unchanged: split cookie/localStorage assertions, real process restart, identity isolation; no sleeps-as-fix, cookie backup, or default-store fallback.
+
+API note: `objc2-foundation` 0.3.2 source was not in the local registry; `NSHTTPCookie::isSessionOnly` / `expiresDate` are wrapped in `#[allow(unused_unsafe)] unsafe` so the build is correct whichever safety marking the bindings use. `NSDate` feature is already active (`macos.rs` uses `NSDate::distantPast`).
+
+### Reading the next CI run
+
+The disk snapshot is taken **after the writer process exited**, so it shows the post-teardown state, not what was on disk before exit.
+
+- `cookies-file: absent` or `cookie-name-matches: 0` after write, with `session_only=0 has_expiry=1` → **consistent with** H1 but inconclusive: the check only looks at one assumed path and a raw cookie-name byte match, so an alternate store layout/location, a different on-disk encoding, or a cookie written then deleted during teardown all read the same. Do **not** claim "never written". Corroborate with the WebKit log (`destroySession` for the store before exit, no flush) and then the fixture-only A/B (keep the store retained until `terminate:`), **not** a fix.
+- `cookie-name-matches: ≥1` after write → cookie was on disk after writer exit; H1 weakened; investigate H2 (`localhost` A/B).
+- `session_only=1` or `has_expiry=0` → H3.
+- If H1 holds, it is not test-only: `sync_browser_profile` replaces the browser context on identity switch. A fix is a lifecycle decision (process-lifetime stores, or private flush API with distribution risk) — stop and design.
+- Passing this fixture does not validate Google SSO (`HttpOnly`/`Secure` `Set-Cookie` over HTTPS, embedded-webview restrictions).
+
 ## Rollback
 
 Revert diagnostic commits only; on-disk persistence roots under `RUNNER_TEMP` / user data dirs are untouched.
