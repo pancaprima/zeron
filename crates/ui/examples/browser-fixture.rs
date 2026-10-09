@@ -1,11 +1,19 @@
-#[path = "browser-fixture/transcript_links.rs"]
-mod transcript_links;
 #[cfg(target_os = "linux")]
 #[path = "browser-fixture/linux.rs"]
 mod linux;
+#[path = "browser-fixture/persistence.rs"]
+mod persistence;
+#[cfg(target_os = "macos")]
+#[path = "browser-fixture/loopback.rs"]
+mod loopback;
+#[cfg(target_os = "macos")]
+#[path = "browser-fixture/persistence_harness.rs"]
+mod persistence_harness;
+#[path = "browser-fixture/transcript_links.rs"]
+mod transcript_links;
 // Real shell + native WebKit smoke test and screenshot fixture. Synthetic
 // chat data, isolated temp storage, loopback-only website, no engine services.
-use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{px, size, AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -144,18 +152,49 @@ fn validate_blur(
     Ok(())
 }
 
+fn fixture_temp_base() -> PathBuf {
+    if let Ok(root) = std::env::var("ZERON_BROWSER_PERSISTENCE_ROOT") {
+        return PathBuf::from(root);
+    }
+    let base = std::env::var("RUNNER_TEMP")
+        .or_else(|_| std::env::var("TMPDIR"))
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into());
+    PathBuf::from(base)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
         .init();
-    let output = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "/tmp/zeron-browser-captures".into()),
-    );
+    if let Ok(phase) = std::env::var("ZERON_BROWSER_PERSISTENCE_PHASE") {
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!(
+            "ZERON_BROWSER_PERSISTENCE_PHASE={phase} requires native macOS WebKit"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let root = persistence_harness::persistence_root();
+            let data = persistence_harness::app_data_dir(&root);
+            let output = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| {
+                root.join("captures")
+                    .join(&phase)
+                    .to_string_lossy()
+                    .into()
+            }));
+            return persistence_harness::run_app(&phase, data, output);
+        }
+    }
+    let scratch = fixture_temp_base().join(format!("zeron-browser-fixture-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)?;
+    let output = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| {
+        scratch
+            .join("zeron-browser-captures")
+            .to_string_lossy()
+            .into()
+    }));
     std::fs::create_dir_all(&output)?;
-    let temp = tempfile::tempdir()?;
-    let data = temp.path().to_path_buf();
+    let data = scratch.join("app-data");
+    std::fs::create_dir_all(&data)?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let _origin = format!("http://{}", listener.local_addr()?);
     std::thread::spawn(move || {
@@ -277,7 +316,7 @@ fn main() -> anyhow::Result<()> {
                     second.read_with(cx, |b, _| b.fixture_eval("document.title = document.cookie.includes('browserfixture=shared') ? 'Shared login' : 'Missing cookie'"));
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     while !second.read_with(cx, |b, _| b.page.title == "Shared login") {
-                        anyhow::ensure!(std::time::Instant::now() < deadline, "tabs did not share ephemeral website data"); pause(cx, 50).await;
+                        anyhow::ensure!(std::time::Instant::now() < deadline, "tabs did not share profile website data"); pause(cx, 50).await;
                     }
                     anyhow::ensure!(first.read_with(cx, |b, _| b.page.title == "Updated title"), "second tab replaced first tab state");
                 }

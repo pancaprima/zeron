@@ -1,6 +1,6 @@
 use super::*;
 use gpui::{
-    AnyWindowHandle, Entity, MouseButton, Pixels, PlatformInput, Point, WindowHandle, point,
+    point, AnyWindowHandle, Entity, MouseButton, Pixels, PlatformInput, Point, WindowHandle,
 };
 use zeron_ui::browser::BrowserSurface;
 

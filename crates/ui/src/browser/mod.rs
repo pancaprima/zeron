@@ -3,6 +3,12 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_store_registry;
+#[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+mod macos_fixture_store_retention;
+#[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+mod macos_persistence_diag;
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(target_os = "macos")]
@@ -12,6 +18,9 @@ mod windows_webview;
 #[cfg(windows)]
 use windows_webview as native;
 pub mod model;
+#[cfg(any(feature = "browser-fixture", test))]
+pub mod persistence_probe;
+mod profile;
 mod view;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -69,13 +78,80 @@ pub enum BrowserEvent {
     Changed,
     NewTab(Option<String>),
     Close,
+    RequestClearBrowserData,
 }
 
-/// A window/profile's ephemeral website data, allocated on first navigation.
-#[derive(Clone, Default)]
+/// Website data for the active Zeron workspace profile (persistent when identity is known).
+#[derive(Clone)]
 pub struct BrowserContext {
+    profile: profile::BrowserProfileMode,
     #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     data: native::BrowserData,
+    clearing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Default for BrowserContext {
+    fn default() -> Self {
+        Self::deferred()
+    }
+}
+
+impl BrowserContext {
+    pub fn deferred() -> Self {
+        Self {
+            profile: profile::BrowserProfileMode::Deferred,
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            data: native::BrowserData::new(profile::BrowserProfileMode::Deferred),
+            clearing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub fn persistent(data_dir: &std::path::Path, locator: &str) -> Result<Self, String> {
+        let profile = profile::BrowserProfileMode::persistent(data_dir, locator)?;
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let data = native::BrowserData::new(profile.clone());
+        Ok(Self {
+            profile,
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            data,
+            clearing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    pub fn is_clearing(&self) -> bool {
+        self.clearing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn set_clearing(&self, clearing: bool) {
+        self.clearing.store(clearing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn profile_mode(&self) -> &profile::BrowserProfileMode {
+        &self.profile
+    }
+
+    pub fn can_clear_website_data(&self) -> bool {
+        self.profile.is_persistent()
+    }
+
+    /// Remove cookies, cache, and local website storage for this profile only.
+    pub fn clear_website_data(&self, cx: &App) -> gpui::Task<Result<(), String>> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        {
+            if !self.profile.is_persistent() {
+                return gpui::Task::ready(Err(
+                    "Browser data can only be cleared after your workspace identity is ready."
+                        .into(),
+                ));
+            }
+            self.data.clear_website_data(cx)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            let _ = cx;
+            gpui::Task::ready(Err("Integrated browser is unavailable on this platform.".into()))
+        }
+    }
 }
 
 pub struct BrowserSurface {
@@ -324,6 +400,9 @@ impl BrowserSurface {
     }
 
     pub fn navigate(&mut self, input: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context.is_clearing() {
+            return;
+        }
         let url = match model::normalize_address(input) {
             Ok(url) => url,
             Err(message) => {
@@ -418,6 +497,14 @@ impl BrowserSurface {
     fn clear_favicon(&mut self, cx: &mut Context<Self>) {
         if let Some(image) = self.favicon.take() {
             cx.defer(move |cx| gpui::ImageSource::Image(image).evict(None, cx));
+        }
+    }
+
+    pub fn reload_after_data_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.page.url.clone();
+        self.close(cx);
+        if let Some(url) = url {
+            self.navigate(&url, window, cx);
         }
     }
 
@@ -648,6 +735,17 @@ impl BrowserSurface {
     pub fn fixture_geometry(&self) -> (f32, f32, f32) {
         self.native.as_ref().unwrap().fixture_geometry()
     }
+    #[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+    pub fn fixture_native_cookie_diag(
+        &self,
+        cookie_name: &str,
+        cx: &App,
+    ) -> gpui::Task<Result<String, String>> {
+        match self.native.as_ref() {
+            Some(native) => native.fixture_native_cookie_diag(cookie_name, cx),
+            None => gpui::Task::ready(Err("browser native page missing".to_string())),
+        }
+    }
     pub fn fixture_eval(&self, script: &str) {
         #[cfg(target_os = "macos")]
         if let Some(native) = &self.native {
@@ -706,6 +804,36 @@ mod tests {
                 window.blur();
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    #[test]
+    fn persistent_context_is_scoped_to_locator() {
+        let dir = profile::test_dirs::UniqueTestDir::new("browser-context").unwrap();
+        let context = BrowserContext::persistent(dir.path(), "0123456789abcdef").unwrap();
+        assert!(context.can_clear_website_data());
+        let storage = context.profile_mode().storage().unwrap();
+        assert_eq!(storage.locator, "0123456789abcdef");
+        assert!(storage.storage_root().starts_with(dir.path()));
+    }
+
+    #[test]
+    fn persistent_context_rejects_bad_locator() {
+        let dir = profile::test_dirs::UniqueTestDir::new("browser-context-bad").unwrap();
+        assert!(BrowserContext::persistent(dir.path(), "not-a-valid-locator").is_err());
+    }
+
+    #[test]
+    fn deferred_context_stays_non_persistent() {
+        let context = BrowserContext::default();
+        assert!(!context.can_clear_website_data());
+    }
+
+    #[test]
+    fn clearing_flag_blocks_navigation_intent() {
+        let context = BrowserContext::default();
+        context.set_clearing(true);
+        assert!(context.is_clearing());
     }
 
     #[gpui::test]
