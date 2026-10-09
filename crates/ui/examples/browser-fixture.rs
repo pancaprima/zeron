@@ -3,6 +3,12 @@
 mod linux;
 #[path = "browser-fixture/persistence.rs"]
 mod persistence;
+#[cfg(target_os = "macos")]
+#[path = "browser-fixture/loopback.rs"]
+mod loopback;
+#[cfg(target_os = "macos")]
+#[path = "browser-fixture/persistence_harness.rs"]
+mod persistence_harness;
 #[path = "browser-fixture/transcript_links.rs"]
 mod transcript_links;
 // Real shell + native WebKit smoke test and screenshot fixture. Synthetic
@@ -146,11 +152,39 @@ fn validate_blur(
     Ok(())
 }
 
+fn fixture_temp_base() -> PathBuf {
+    if let Ok(root) = std::env::var("ZERON_BROWSER_PERSISTENCE_ROOT") {
+        return PathBuf::from(root);
+    }
+    let base = std::env::var("RUNNER_TEMP")
+        .or_else(|_| std::env::var("TMPDIR"))
+        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into());
+    PathBuf::from(base)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
         .init();
-    let scratch = PathBuf::from("/root/.hermes/profiles/girlfriend/cache/scratch");
+    if let Ok(phase) = std::env::var("ZERON_BROWSER_PERSISTENCE_PHASE") {
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!(
+            "ZERON_BROWSER_PERSISTENCE_PHASE={phase} requires native macOS WebKit"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let root = persistence_harness::persistence_root();
+            let data = persistence_harness::app_data_dir(&root);
+            let output = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| {
+                root.join("captures")
+                    .join(&phase)
+                    .to_string_lossy()
+                    .into()
+            }));
+            return persistence_harness::run_app(&phase, data, output);
+        }
+    }
+    let scratch = fixture_temp_base().join(format!("zeron-browser-fixture-{}", std::process::id()));
     std::fs::create_dir_all(&scratch)?;
     let output = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| {
         scratch
@@ -159,7 +193,7 @@ fn main() -> anyhow::Result<()> {
             .into()
     }));
     std::fs::create_dir_all(&output)?;
-    let data = scratch.join(format!("zeron-browser-fixture-{}", std::process::id()));
+    let data = scratch.join("app-data");
     std::fs::create_dir_all(&data)?;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let _origin = format!("http://{}", listener.local_addr()?);

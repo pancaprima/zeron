@@ -9,7 +9,10 @@ mod spec {
     use zeron_ui::browser::BrowserContext;
 
     fn scratch() -> PathBuf {
-        PathBuf::from("/root/.hermes/profiles/girlfriend/cache/scratch/zeron-browser-fixture-spec")
+        let base = std::env::var("RUNNER_TEMP")
+            .or_else(|_| std::env::var("TMPDIR"))
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into());
+        PathBuf::from(base).join("zeron-browser-fixture-spec")
     }
 
     #[test]

@@ -46,6 +46,12 @@ impl BrowserData {
     }
 
     pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
+        #[cfg(feature = "browser-fixture")]
+        if std::env::var_os("ZERON_BROWSER_FIXTURE_INJECT_CLEAR_ERROR").is_some() {
+            return gpui::Task::ready(Err(
+                "Fixture-injected clear failure (test-only; not a real WebKit error).".into(),
+            ));
+        }
         let data = self.clone();
         cx.spawn(async move |_cx| {
             let mtm = MainThreadMarker::new().ok_or_else(|| {

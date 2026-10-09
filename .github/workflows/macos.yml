@@ -10,6 +10,7 @@ on:
       - 'edge/**'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/ci/run-macos-fixture.sh'
+      - 'scripts/ci/run-macos-browser-persistence-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/macos.yml'
@@ -23,6 +24,7 @@ on:
       - 'edge/**'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/ci/run-macos-fixture.sh'
+      - 'scripts/ci/run-macos-browser-persistence-fixture.sh'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/macos.yml'
@@ -131,6 +133,13 @@ jobs:
         run: |
           scripts/ci/run-macos-fixture.sh target/debug/examples/browser-fixture "$RUNNER_TEMP/browser-captures"
           test -f "$RUNNER_TEMP/browser-captures/result.txt"
+      - name: Native browser persistence acceptance
+        timeout-minutes: 12
+        env:
+          RUST_BACKTRACE: 1
+          FIXTURE_ATTEMPT_TIMEOUT: 90
+        run: |
+          scripts/ci/run-macos-browser-persistence-fixture.sh target/debug/examples/browser-fixture
       - name: Upload browser screenshots
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

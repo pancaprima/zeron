@@ -3679,6 +3679,35 @@ impl Shell {
         });
     }
 
+    fn sync_browser_profile(&mut self, cx: &mut Context<Self>) {
+        let browser_profile = {
+            let state = self.state.read(cx);
+            crate::links::workspace_locator(
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+        };
+        if browser_profile != self.browser_profile {
+            if self.browser_profile.is_some() || !self.browsers.is_empty() {
+                for browser in self.browsers.values() {
+                    browser.update(cx, |browser, cx| browser.close(cx));
+                }
+                self.browsers.clear();
+                self.browser_subs.clear();
+            }
+            self.browser_profile = browser_profile.clone();
+            self.browser_context = match browser_profile {
+                Some(locator) => crate::browser::BrowserContext::persistent(&self.data_dir, &locator)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "browser profile storage unavailable");
+                        crate::browser::BrowserContext::default()
+                    }),
+                None => crate::browser::BrowserContext::default(),
+            };
+        }
+    }
+
     fn confirm_browser_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.browser_clear_confirm = false;
         if self.browser_clear_task.is_some() {
@@ -12857,32 +12886,7 @@ impl Render for Shell {
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
 
-        let browser_profile = {
-            let state = self.state.read(cx);
-            crate::links::workspace_locator(
-                state.workspace_scope,
-                state.auth.as_ref(),
-                state.local_device_id.as_deref(),
-            )
-        };
-        if browser_profile != self.browser_profile {
-            if self.browser_profile.is_some() || !self.browsers.is_empty() {
-                for browser in self.browsers.values() {
-                    browser.update(cx, |browser, cx| browser.close(cx));
-                }
-                self.browsers.clear();
-                self.browser_subs.clear();
-            }
-            self.browser_profile = browser_profile.clone();
-            self.browser_context = match browser_profile {
-                Some(locator) => crate::browser::BrowserContext::persistent(&self.data_dir, &locator)
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "browser profile storage unavailable");
-                        crate::browser::BrowserContext::default()
-                    }),
-                None => crate::browser::BrowserContext::default(),
-            };
-        }
+        self.sync_browser_profile(cx);
         let browser_active = matches!(gate, GatePhase::Ready)
             && !restart_required
             && matches!(self.route, Route::Chat)
@@ -16767,6 +16771,53 @@ impl Shell {
     pub fn fixture_resize_browser(&mut self, width: f32, cx: &mut Context<Self>) {
         self.settings.right_pane_width = width;
         cx.notify();
+    }
+    pub fn fixture_set_local_device_id(&mut self, device_id: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.local_device_id = Some(device_id.into());
+            if !state.devices.iter().any(|device| device.id == device_id) {
+                state.devices.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": device_id,
+                        "name": "Fixture device",
+                        "platform": std::env::consts::OS,
+                        "lastSeenAt": null
+                    }))
+                    .expect("fixture device json"),
+                );
+            }
+            cx.notify();
+        });
+        self.sync_browser_profile(cx);
+        cx.notify();
+    }
+    pub fn fixture_browser_clear_dialog(&mut self, open: bool, cx: &mut Context<Self>) {
+        if open && self.browser_clear_task.is_none() {
+            self.browser_clear_confirm = true;
+        } else if !open {
+            self.browser_clear_confirm = false;
+        }
+        cx.notify();
+    }
+    pub fn fixture_confirm_browser_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_browser_clear(window, cx);
+    }
+    pub fn fixture_cancel_browser_clear(&mut self, cx: &mut Context<Self>) {
+        self.browser_clear_confirm = false;
+        cx.notify();
+    }
+    pub fn fixture_browser_clear_confirm_open(&self) -> bool {
+        self.browser_clear_confirm
+    }
+    pub fn fixture_browser_clear_error(&self) -> Option<String> {
+        self.browser_clear_error.clone()
+    }
+    pub fn fixture_dismiss_browser_clear_error(&mut self, cx: &mut Context<Self>) {
+        self.browser_clear_error = None;
+        cx.notify();
+    }
+    pub fn fixture_browser_clear_busy(&self) -> bool {
+        self.browser_clear_task.is_some() || self.browser_context.is_clearing()
     }
 }
 
