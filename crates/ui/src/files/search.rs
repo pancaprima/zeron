@@ -824,7 +824,8 @@ impl FilesSurface {
             .path
             .rsplit('/')
             .next()
-            .unwrap_or(result.path.as_str());
+            .unwrap_or(result.path.as_str())
+            .to_string();
         let header = format!("{}:{}", result.path, result.line);
         div()
             .id(("files-content-search-result", index))
@@ -856,7 +857,7 @@ impl FilesSurface {
                     .gap(px(6.0))
                     .overflow_hidden()
                     .child(
-                        file_icons::icon(FileIconIdentity::file(file_name), theme.appearance)
+                        file_icons::icon(FileIconIdentity::file(&file_name), theme.appearance)
                             .size(px(14.0))
                             .flex_none(),
                     )
@@ -1028,7 +1029,7 @@ fn render_preview_highlights(
     theme: &Theme,
 ) -> AnyElement {
     if highlights.is_empty() {
-        return div().truncate().child(preview).into_any_element();
+        return div().truncate().child(preview.to_string()).into_any_element();
     }
     let mut elements = Vec::new();
     let mut cursor = 0usize;
