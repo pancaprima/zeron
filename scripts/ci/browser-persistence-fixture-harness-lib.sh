@@ -168,5 +168,5 @@ run_causal_lifecycle_contrast() {
   local ts="$$"
   run_causal_lifecycle_arm baseline 0 fixture-causal-baseline "$RUNNER_TEMP/zeron-causal-lifecycle-baseline-$ts"
   run_causal_lifecycle_arm retain-datastore 1 fixture-causal-retain "$RUNNER_TEMP/zeron-causal-lifecycle-retain-$ts"
-  echo "causal-lifecycle boundary phase=contrast-end interpretation=if baseline verify fails and retain verify passes with cookie on disk after retain write, supports store-teardown-before-flush hypothesis (not a product fix)"
+  echo "causal-lifecycle boundary phase=contrast-end interpretation=production uses process store registry; baseline arm no longer expects verify failure. If retain arm still passes with extra fixture forget, redundant pin is harmless. Historical: pre-registry baseline verify failed while retain passed (store-teardown hypothesis)."
 }

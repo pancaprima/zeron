@@ -29,7 +29,7 @@ unset ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE || true
 unset ZERON_BROWSER_PERSISTENCE_DEVICE_A || true
 export ZERON_BROWSER_PERSISTENCE_ROOT="$PERSIST_ROOT"
 WRITE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
-echo "acceptance-lifecycle boundary phase=release-harness fixture_lifecycle=baseline-teardown root=$PERSIST_ROOT"
+echo "acceptance-lifecycle boundary phase=release-harness fixture_lifecycle=production-store-registry retain_env=unset root=$PERSIST_ROOT"
 run_phase relaunch-write
 test -f "$PERSIST_ROOT/relaunch-marker.json"
 ( set +e; dump_store_evidence after-relaunch-write-exit "$PERSIST_ROOT" ) || true

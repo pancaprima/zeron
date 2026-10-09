@@ -3,6 +3,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_store_registry;
 #[cfg(all(target_os = "macos", feature = "browser-fixture"))]
 mod macos_fixture_store_retention;
 #[cfg(all(target_os = "macos", feature = "browser-fixture"))]

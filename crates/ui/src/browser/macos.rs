@@ -107,8 +107,15 @@ impl BrowserData {
                 }
                 BrowserProfileMode::Persistent(storage) => {
                     use objc2_foundation::NSUUID;
-                    let uuid = NSUUID::from_bytes(storage.store_uuid().into_bytes());
-                    objc2_web_kit::WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm)
+                    let store_uuid = storage.store_uuid();
+                    super::macos_store_registry::get_or_open_persistent_store(
+                        store_uuid,
+                        mtm,
+                        |mtm| {
+                            let uuid = NSUUID::from_bytes(store_uuid.into_bytes());
+                            objc2_web_kit::WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm)
+                        },
+                    )
                 }
             }
         })
@@ -119,14 +126,23 @@ impl BrowserData {
         mtm: MainThreadMarker,
     ) -> Result<Retained<objc2_web_kit::WKWebsiteDataStore>, String> {
         let profile = self.0.borrow().profile.clone();
+        if self.0.borrow().store.is_some() {
+            return self
+                .0
+                .borrow()
+                .store
+                .clone()
+                .ok_or_else(|| "Browser store unavailable".into());
+        }
+        let store = self.open_store(mtm, profile)?;
+        let preview_hosts = self.0.borrow().preview_hosts.clone();
+        if let Err(error) = configure_preview_proxy(&store, &preview_hosts) {
+            tracing::warn!(%error, "preview hostname proxy unavailable");
+        }
+        #[cfg(feature = "browser-fixture")]
+        super::macos_fixture_store_retention::retain_exact_store_if_enabled(store.clone());
         let mut state = self.0.borrow_mut();
         if state.store.is_none() {
-            let store = self.open_store(mtm, profile)?;
-            if let Err(error) = configure_preview_proxy(&store, &state.preview_hosts) {
-                tracing::warn!(%error, "preview hostname proxy unavailable");
-            }
-            #[cfg(feature = "browser-fixture")]
-            super::macos_fixture_store_retention::retain_exact_store_if_enabled(store.clone());
             state.store = Some(store);
         }
         state

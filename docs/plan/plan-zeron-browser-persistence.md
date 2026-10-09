@@ -6,7 +6,7 @@ Status: user approved scope and implementation. Implementation branch `feat/brow
 
 - [x] Isolated worktree and plan copy under `docs/plan/`.
 - [x] `browser/profile.rs`: validated 16-hex locator, scoped storage paths, deterministic store UUIDs, private dir permissions (Unix).
-- [x] macOS: `WKWebsiteDataStore::dataStoreForIdentifier` via `NSUUID::from_bytes`; no silent ephemeral fallback for persistent mode; clear on GPUI main executor with async oneshot (no background-thread `MainThreadMarker` / blocking channel).
+- [x] macOS: `WKWebsiteDataStore::dataStoreForIdentifier` via `NSUUID::from_bytes`; process-lifetime store registry (`macos_store_registry.rs`) pins persistent stores by UUID across tab/window teardown; no silent ephemeral fallback for persistent mode; clear on GPUI main executor with async oneshot (no background-thread `MainThreadMarker` / blocking channel).
 - [x] Linux: `g_object_new` website data manager + explicit SQLite cookie store; `webkit_website_data_manager_clear` with cancellable slot and broad data types; shared `clear_waiter` `Arc`; helper-death / timeout completion.
 - [x] Windows: profile from `ICoreWebView2_13::Profile` when available, else `ICoreWebView2Environment11::CreateCoreWebView2Profile`; async clear with oneshot; persistent profiles do not fall back to per-run PID folders on `ERROR_BUSY`.
 - [x] Shell: locator snapshot during clear, `set_clearing` guard, single clear task, `reload_after_data_clear`, profile-change guard.

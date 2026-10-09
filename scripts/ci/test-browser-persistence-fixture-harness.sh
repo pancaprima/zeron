@@ -154,4 +154,17 @@ set -e
 [ "$fixed_rc" -eq 5 ] || fail "|| pattern must capture 5 got $fixed_rc"
 pass 'exit capture uses || not if !'
 
+# --- production registry core (rustc leaf, no workspace build) ---
+registry_bin_dir="$(mktemp -d "$RUNNER_TEMP/registry-bin.XXXXXX")"
+registry_test_bin="$registry_bin_dir/browser_store_registry_leaf"
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}"
+rustc --test "$ROOT/scripts/ci/browser_store_registry_leaf.rs" -o "$registry_test_bin"
+"$registry_test_bin"
+pass 'browser_store_registry_leaf'
+
+retain_env_bin="$registry_bin_dir/browser_persistence_fixture_retain_env"
+rustc "$ROOT/scripts/ci/browser_persistence_fixture_retain_env.rs" -o "$retain_env_bin"
+"$retain_env_bin"
+pass 'browser_persistence_fixture_retain_env'
+
 echo "all browser persistence harness shell regressions passed"
