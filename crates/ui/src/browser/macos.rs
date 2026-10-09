@@ -125,6 +125,8 @@ impl BrowserData {
             if let Err(error) = configure_preview_proxy(&store, &state.preview_hosts) {
                 tracing::warn!(%error, "preview hostname proxy unavailable");
             }
+            #[cfg(feature = "browser-fixture")]
+            super::macos_fixture_store_retention::retain_exact_store_if_enabled(store.clone());
             state.store = Some(store);
         }
         state

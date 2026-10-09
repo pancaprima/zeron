@@ -21,6 +21,11 @@ pub const MARKER_VALUE: &str = "zeron-persist-marker-v1";
 pub const DEVICE_A: &str = "local";
 pub const DEVICE_B: &str = "fixture-device-b";
 
+/// Override via `ZERON_BROWSER_PERSISTENCE_DEVICE_A` so causal A/B arms get distinct locators / store UUIDs.
+pub fn persistence_device_a() -> String {
+    std::env::var("ZERON_BROWSER_PERSISTENCE_DEVICE_A").unwrap_or_else(|_| DEVICE_A.into())
+}
+
 pub fn persistence_root() -> PathBuf {
     std::env::var("ZERON_BROWSER_PERSISTENCE_ROOT")
         .map(PathBuf::from)
@@ -66,7 +71,18 @@ fn log_persistence_boundary(
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
     let profile = window.update(cx, |shell, _, _| shell.fixture_browser_persistence_diag())?;
-    eprintln!("persistence-diag phase={phase} origin={origin} profile={profile}");
+    let lifecycle =
+        if matches!(
+            std::env::var("ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE").as_deref(),
+            Ok("1")
+        ) {
+            "retain-website-data-store"
+        } else {
+            "baseline-teardown"
+        };
+    eprintln!(
+        "persistence-diag phase={phase} origin={origin} profile={profile} fixture_lifecycle={lifecycle}"
+    );
     Ok(())
 }
 
@@ -261,7 +277,7 @@ fn write_relaunch_marker(
             "cookieName": COOKIE_NAME,
             "localStorageKey": LS_KEY,
             "markerValue": MARKER_VALUE,
-            "deviceA": DEVICE_A,
+            "deviceA": persistence_device_a(),
             "profileDiag": profile_diag,
         }))?,
     )?;
@@ -389,7 +405,7 @@ pub async fn run_phase(
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b, w, cx))?;
             pause(cx, 200).await;
             window.update(cx, |shell, _, cx| {
-                shell.fixture_set_local_device_id(DEVICE_A, cx)
+                shell.fixture_set_local_device_id(&persistence_device_a(), cx)
             })?;
             pause(cx, 300).await;
             let (_id_a2, browser_a2) = open_browser(window, cx).await?;
@@ -443,7 +459,7 @@ pub async fn run_phase(
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b, w, cx))?;
             pause(cx, 200).await;
             window.update(cx, |shell, _, cx| {
-                shell.fixture_set_local_device_id(DEVICE_A, cx)
+                shell.fixture_set_local_device_id(&persistence_device_a(), cx)
             })?;
             pause(cx, 300).await;
             let (_id_a, browser_a) = open_browser(window, cx).await?;
@@ -476,7 +492,7 @@ pub async fn run_phase(
             })?;
             pause(cx, 200).await;
             window.update(cx, |shell, _, cx| {
-                shell.fixture_set_local_device_id(DEVICE_A, cx)
+                shell.fixture_set_local_device_id(&persistence_device_a(), cx)
             })?;
             pause(cx, 200).await;
             write_success(
@@ -566,10 +582,11 @@ pub fn bootstrap_state(data: PathBuf, cx: &mut gpui::App) -> gpui::Entity<state:
         let mut s = state::AppState::new();
         s.connection = zeron_proto::view::ConnectionStatus::Ready;
         s.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
-        s.local_device_id = Some(DEVICE_A.into());
+        let device_a = persistence_device_a();
+        s.local_device_id = Some(device_a.clone());
         s.devices = vec![
             serde_json::from_value(serde_json::json!({
-                "id": DEVICE_A,
+                "id": device_a.clone(),
                 "name": "This device",
                 "platform": std::env::consts::OS,
                 "lastSeenAt": null
@@ -591,7 +608,7 @@ pub fn bootstrap_state(data: PathBuf, cx: &mut gpui::App) -> gpui::Entity<state:
         s.spaces = vec![
             serde_json::from_value(serde_json::json!({
                 "id": "project",
-                "deviceId": DEVICE_A,
+                "deviceId": device_a.clone(),
                 "path": "/tmp/fieldnotes",
                 "createdAt": "2026-09-08T00:00:00Z"
             }))
@@ -600,7 +617,7 @@ pub fn bootstrap_state(data: PathBuf, cx: &mut gpui::App) -> gpui::Entity<state:
         s.chats = vec![
             serde_json::from_value(serde_json::json!({
                 "id": "browser-fixture",
-                "deviceId": DEVICE_A,
+                "deviceId": device_a.clone(),
                 "spaceId": "project",
                 "title": "Build the Fieldnotes workspace",
                 "archived": false,

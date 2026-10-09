@@ -8,6 +8,7 @@ Status: **approved investigation step** — macOS fixture-only native cookie rea
 |--------|---------|
 | Linux CI log `zeron-browser-native-linux-failed.log` | `browser::tests::persistent_context_is_scoped_to_locator` failed: `create_dir_all` on hardcoded `/root/.hermes/...` → **Permission denied** (code 13). |
 | macOS CI log `zeron-restart-diagnostics-macos-failed.log` (2026-10-09) | `relaunch-write` passed (JS readback **cookie=1** and **localStorage=1**); new process `relaunch-verify` failed 3/3 with **`restart-verify: cookie missing (other storage present)`** — same `origin`, `locator`, `store_uuid` in boundary logs. |
+| macOS CI log `zeron-cbf-cookie-disk-ci-failed.log` (2026-10-09) | Writer native diag **`matches=1 session_only=0 has_expiry=1`** on persistent store `263b2c57-bada-4815-811b-0b111750230a`; after writer exit **`Cookies/Cookies.binarycookies` absent**, `Cookies/` empty while **`LocalStorage` / `Origins` present**; WebKit log **`WebsiteDataStore::~WebsiteDataStore`** then **`NetworkProcess::destroySession identifier=263b2c57-…`** at 16:15:59.722 before verify; verify native **`present=0`** 3/3 with other storage present. |
 | Prior macOS log `zeron-browser-native-macos-failed.log` | Generic partial-state before split probe errors. |
 | Investigation summary | No documented WebKit API to force HTTP cookie disk flush; macOS never passes `webkit-data` dirs to WebKit (uses `dataStoreForIdentifier` only); production teardown remains `Host::drop` with `stopLoading` only. |
 | Parent plans | `docs/plan/plan-zeron-browser-persistence.md`, `/root/docs/plan/plan-zeron-ci-dmg.md` — native acceptance pending; VPS must not run heavy `cargo` builds. |
@@ -44,6 +45,7 @@ If CI shows `write-storage:after-readback-native present=1` and `restart-verify:
 
 | Area | Change |
 |------|--------|
+| `crates/ui/src/browser/macos_fixture_store_retention.rs` | Fixture-only `ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE=1` process-lifetime `mem::forget(Retained<WKWebsiteDataStore>)` pin (causal A/B writer arm). |
 | `crates/ui/src/browser/macos_persistence_diag.rs` | Sibling module under `browser/`; async fixture readback only. |
 | `crates/ui/src/browser/macos.rs` | `fixture_native_cookie_diag` → `Task`; no teardown drain. |
 | `crates/ui/examples/browser-fixture/persistence_harness.rs` | Await native diag after write readback and before verify split `bail`. |
@@ -142,6 +144,34 @@ The disk snapshot is taken **after the writer process exited**, so it shows the 
 - `session_only=1` or `has_expiry=0` → H3.
 - If H1 holds, it is not test-only: `sync_browser_profile` replaces the browser context on identity switch. A fix is a lifecycle decision (process-lifetime stores, or private flush API with distribution risk) — stop and design.
 - Passing this fixture does not validate Google SSO (`HttpOnly`/`Secure` `Set-Cookie` over HTTPS, embedded-webview restrictions).
+
+### Causal lifecycle A/B (fixture-only; 2026-10-09)
+
+**Goal:** Test whether **releasing the persistent `WKWebsiteDataStore` during normal fixture teardown** (while the process still runs GPUI quit) prevents cookie disk persistence, without claiming a product fix.
+
+| Arm | Env | Process | Expected if H1 (teardown-before-flush) |
+|-----|-----|---------|----------------------------------------|
+| `baseline` | unset `ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE` | Writer exits with normal shell/window teardown | `relaunch-verify` **fails** (release acceptance); post-write disk evidence **cookie file absent** (as in `zeron-cbf-cookie-disk-ci-failed.log`) |
+| `retain-datastore` | `ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE=1` on **writer only** | Same store instance leaked via one `std::mem::forget(Retained<WKWebsiteDataStore>)` per opened store at first `ensure_store` (no static `Send`/`Sync` registry); window/state teardown unchanged; verifier is a **new process** without the env | If H1: post-write disk **`cookie-name-matches ≥ 1`** and **new-process** `relaunch-verify` **passes** cookie+localStorage |
+
+**Isolation:** `scripts/ci/run-macos-browser-persistence-fixture.sh` runs contrast first with separate `ZERON_BROWSER_PERSISTENCE_ROOT` and `ZERON_BROWSER_PERSISTENCE_DEVICE_A` (`fixture-causal-baseline` vs `fixture-causal-retain`) so locator-derived `store_uuid` and WebKit subtrees do not cross-contaminate arms. Release harness then runs on default `local` device and `PERSIST_ROOT` with `acceptance-lifecycle boundary` logs.
+
+**Not acceptance:** Contrast logs `causal-lifecycle outcome … (diagnostic only; not release acceptance)` and is wrapped in `set +e`; **only** the subsequent `relaunch-write` / `relaunch-verify` pair (and later phases) set job exit status.
+
+**Rust retention mechanics (fixture):** `macos_fixture_store_retention.rs` calls `std::mem::forget` on one `Retained<WKWebsiteDataStore>` clone per opened store when `ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE=1` exactly — intentionally **not** dropped until process exit. This outlives `Host::drop` / `remove_window` / `cx.quit()` because those only clear GPUI/browser refs; the forgotten `Retained` keeps the Objective-C store alive until the OS tears down the process. No static `Mutex<Vec<…>>` (main-thread ObjC is not `Send`/`Sync`). **Do not** treat a passing retain arm as shipping criteria.
+
+**Manual rerun (macOS runner, after `browser-fixture` binary exists):**
+
+```bash
+export ZERON_BROWSER_PERSISTENCE_ROOT=/tmp/zeron-causal-test
+export ZERON_BROWSER_PERSISTENCE_DEVICE_A=fixture-causal-retain
+export ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE=1
+export ZERON_BROWSER_PERSISTENCE_PHASE=relaunch-write
+scripts/run-macos-browser-fixture.sh target/debug/examples/browser-fixture /tmp/cap-write
+unset ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE
+export ZERON_BROWSER_PERSISTENCE_PHASE=relaunch-verify
+scripts/run-macos-browser-fixture.sh target/debug/examples/browser-fixture /tmp/cap-verify
+```
 
 ## Rollback
 

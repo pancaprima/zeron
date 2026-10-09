@@ -4,6 +4,8 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+mod macos_fixture_store_retention;
+#[cfg(all(target_os = "macos", feature = "browser-fixture"))]
 mod macos_persistence_diag;
 #[cfg(target_os = "linux")]
 use linux as native;
