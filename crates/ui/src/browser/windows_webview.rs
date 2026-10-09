@@ -5,6 +5,7 @@
 //! forwards only those that reach the page; the page owns the keyboard while
 //! focused. Callbacks enqueue events and never re-enter GPUI.
 use super::model::{PageState, Presentation, allowed_frame_navigation, allowed_navigation};
+use super::profile::BrowserProfileMode;
 use gpui::{Bounds, CursorStyle, Keystroke, Modifiers, MouseButton, Pixels, Point, Window};
 use std::{
     cell::{Cell, RefCell},
@@ -61,39 +62,120 @@ struct EnvironmentState {
     environment: Environment,
     /// Set once the shared folder answered ERROR_BUSY (see [`is_busy`]).
     own_folder: bool,
-    /// InPrivate profile of this window/profile's pages. Every InPrivate
-    /// controller with the same profile name shares one cookie jar — across
-    /// windows, profile switches and processes sharing the folder — so each
-    /// `BrowserData` gets its own, as macOS gets a fresh non-persistent store.
     profile: String,
+    in_private: bool,
+    user_data_dir: std::path::PathBuf,
+    /// Last profile object from a live WebView2, used when clearing after tabs close.
+    browsing_profile: Option<ICoreWebView2Profile2>,
 }
 
-impl Default for EnvironmentState {
-    fn default() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        Self {
-            environment: Environment::default(),
-            own_folder: false,
-            profile: format!(
-                "zeron-{}-{started}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ),
+fn environment_state(profile: BrowserProfileMode) -> EnvironmentState {
+    match profile {
+        BrowserProfileMode::Deferred => {
+            static NEXT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            EnvironmentState {
+                environment: Environment::default(),
+                own_folder: false,
+                profile: format!(
+                    "zeron-{}-{started}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
+                in_private: true,
+                user_data_dir: user_data_folder(false),
+                browsing_profile: None,
+            }
+        }
+        BrowserProfileMode::Persistent(storage) => {
+            if let Err(error) = storage.ensure_directories() {
+                tracing::warn!(%error, "could not create browser storage directories");
+            }
+            EnvironmentState {
+                environment: Environment::default(),
+                own_folder: false,
+                profile: storage.windows_profile_name(),
+                in_private: false,
+                user_data_dir: storage.webview2_dir(),
+                browsing_profile: None,
+            }
         }
     }
 }
 
 /// A window/profile's WebView2 environment, created on first use: one
-/// browser process for all of its tabs. Pages are InPrivate, so nothing
-/// outlives the session (as macOS's non-persistent store); the user-data
-/// folder only holds the runtime's own caches.
-#[derive(Clone, Default)]
+/// browser process for all of its tabs.
+#[derive(Clone)]
 pub(super) struct BrowserData(Rc<RefCell<EnvironmentState>>);
 
 impl BrowserData {
+    pub(super) fn new(profile: BrowserProfileMode) -> Self {
+        Self(Rc::new(RefCell::new(environment_state(profile))))
+    }
+
+    pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
+        let data = self.clone();
+        cx.spawn(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            data.with_environment(move |environment| match environment {
+                Ok(environment) => match data.browsing_profile_for_clear(&environment) {
+                    Ok(profile) => {
+                        let _ = BrowserData::clear_profile_data(profile, tx);
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                    }
+                },
+                Err(error) => {
+                    let _ = tx.send(Err(error));
+                }
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("WebView2 clear did not finish".into()),
+                Err(_) => Err("Browser data clear timed out".into()),
+            }
+        })
+    }
+
+    fn browsing_profile_for_clear(
+        &self,
+        environment: &ICoreWebView2Environment,
+    ) -> Result<ICoreWebView2Profile2, String> {
+        if let Some(profile) = self.0.borrow().browsing_profile.clone() {
+            return Ok(profile);
+        }
+        profile_for_clear(environment, &self.profile())
+    }
+
+    fn clear_profile_data(
+        profile: ICoreWebView2Profile2,
+        tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> Result<(), String> {
+        let slot = std::sync::Mutex::new(Some(tx));
+        let handler = webview2_com::ClearBrowsingDataCompletedHandler::create(Box::new(
+            move |result| {
+                if let Some(tx) = slot.lock().unwrap().take() {
+                    let _ = tx.send(result.map_err(runtime_error).map(|_| ()));
+                }
+                Ok(())
+            },
+        ));
+        match unsafe { profile.ClearBrowsingDataAll(&handler) } {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = runtime_error(&error);
+                if let Some(tx) = slot.lock().unwrap().take() {
+                    let _ = tx.send(Err(message.clone()));
+                }
+                Err(message)
+            }
+        }
+    }
+
     fn with_environment(
         &self,
         done: impl FnOnce(Result<ICoreWebView2Environment, String>) + 'static,
@@ -132,10 +214,17 @@ impl BrowserData {
         self.0.borrow().profile.clone()
     }
 
+    fn in_private(&self) -> bool {
+        self.0.borrow().in_private
+    }
+
     /// Move this process to its own folder after the shared one was busy.
     /// Returns false when that already happened (no further retries).
     fn fall_back(&self) -> bool {
         let mut state = self.0.borrow_mut();
+        if !state.in_private {
+            return false;
+        }
         if state.own_folder {
             return false;
         }
@@ -202,11 +291,44 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+fn resolved_user_data_folder(state: &EnvironmentState) -> std::path::PathBuf {
+    if state.own_folder && state.in_private {
+        user_data_folder(true)
+    } else {
+        state.user_data_dir.clone()
+    }
+}
+
+fn profile_for_clear(
+    environment: &ICoreWebView2Environment,
+    profile_name: &str,
+) -> Result<ICoreWebView2Profile2, String> {
+    let environment = environment
+        .cast::<ICoreWebView2Environment11>()
+        .map_err(|_| {
+            "Clearing browser data requires WebView2 Runtime 109 or newer (ICoreWebView2Environment11)."
+                .to_string()
+        })?;
+    let profile = environment
+        .CreateCoreWebView2Profile(&HSTRING::from(profile_name))
+        .map_err(runtime_error)?;
+    profile
+        .cast::<ICoreWebView2Profile2>()
+        .map_err(|error| runtime_error(&error))
+}
+
 fn create_environment(shared: std::rc::Weak<RefCell<EnvironmentState>>) {
     let Some(state) = shared.upgrade() else {
         return;
     };
-    let own = state.borrow().own_folder;
+    let (own, folder, in_private) = {
+        let state = state.borrow();
+        (
+            state.own_folder,
+            resolved_user_data_folder(&state),
+            state.in_private,
+        )
+    };
     drop(state);
     let finish = |shared: &std::rc::Weak<RefCell<EnvironmentState>>,
                   outcome: Result<ICoreWebView2Environment, String>| {
@@ -236,7 +358,11 @@ fn create_environment(shared: std::rc::Weak<RefCell<EnvironmentState>>) {
         move |result, environment| {
             match result.and_then(|()| environment.ok_or_else(windows::core::Error::empty)) {
                 Ok(environment) => finish(&callback, Ok(environment)),
-                Err(error) if !own && is_busy(&error) => retry(callback),
+                Err(error) if !own && is_busy(&error) && in_private => retry(callback),
+                Err(error) if !own && is_busy(&error) => finish(
+                    &callback,
+                    Err("Browser storage is in use by another Zeron window. Close the other window and try again.".into()),
+                ),
                 Err(error) => finish(&callback, Err(runtime_error(&error))),
             }
             Ok(())
@@ -245,14 +371,18 @@ fn create_environment(shared: std::rc::Weak<RefCell<EnvironmentState>>) {
     let created = unsafe {
         CreateCoreWebView2EnvironmentWithOptions(
             None,
-            &HSTRING::from(user_data_folder(own).to_string_lossy().as_ref()),
+            &HSTRING::from(folder.to_string_lossy().as_ref()),
             None::<&ICoreWebView2EnvironmentOptions>,
             &handler,
         )
     };
     match created {
         Ok(()) => {}
-        Err(error) if !own && is_busy(&error) => retry(shared),
+        Err(error) if !own && is_busy(&error) && in_private => retry(shared),
+        Err(error) if !own && is_busy(&error) => finish(
+            &shared,
+            Err("Browser storage is in use by another Zeron window. Close the other window and try again.".into()),
+        ),
         Err(error) => finish(&shared, Err(runtime_error(&error))),
     }
 }
@@ -542,6 +672,7 @@ impl Host {
         data: BrowserData,
     ) -> windows::core::Result<()> {
         let profile = HSTRING::from(data.profile());
+        let in_private = data.in_private();
         let attach_environment = environment.clone();
         let weak = Rc::downgrade(host);
         let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
@@ -556,6 +687,9 @@ impl Host {
                         }
                     }
                     Err(error) if is_busy(&error) && data.fall_back() => Host::start(&host, data),
+                    Err(error) if is_busy(&error) => host.fail(
+                        "Browser storage is in use by another Zeron window. Close the other window and try again.",
+                    ),
                     Err(error) => host.fail(&runtime_error(&error)),
                 }
                 Ok(())
@@ -566,7 +700,7 @@ impl Host {
         unsafe {
             let environment = environment.cast::<ICoreWebView2Environment10>()?;
             let options = environment.CreateCoreWebView2ControllerOptions()?;
-            options.SetIsInPrivateModeEnabled(true)?;
+            options.SetIsInPrivateModeEnabled(in_private)?;
             options.SetProfileName(&profile)?;
             environment
                 .CreateCoreWebView2CompositionControllerWithOptions(host.hwnd, &options, &handler)
@@ -580,6 +714,13 @@ impl Host {
     ) -> windows::core::Result<()> {
         let controller: ICoreWebView2Controller = composition.cast()?;
         let webview = unsafe { controller.CoreWebView2()? };
+        if let Ok(webview13) = webview.cast::<ICoreWebView2_13>() {
+            if let Ok(profile) = webview13.Profile() {
+                if let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() {
+                    host.data.0.borrow_mut().browsing_profile = Some(profile2);
+                }
+            }
+        }
         unsafe {
             let settings = webview.Settings()?;
             settings.SetAreDevToolsEnabled(false)?;

@@ -1,13 +1,12 @@
 //! AppKit boundary for the browser. Wry owns the native child and its UI
 //! delegate; our navigation delegate supplies browser policy and state. All
 //! callbacks enqueue events, never re-enter GPUI. No page-to-engine IPC.
-use super::model::{PageState, Presentation, allowed_navigation};
+use super::model::{allowed_navigation, PageState, Presentation};
+use super::profile::BrowserProfileMode;
 use gpui::{Bounds, Pixels, Window};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{
-    DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel,
-};
+use objc2::{class, define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSColor, NSEvent, NSEventMask, NSEventModifierFlags, NSView, NSWindowOrderingMode,
 };
@@ -25,33 +24,98 @@ use std::{
 };
 use wry::{WebView, WebViewBuilderExtMacos, WebViewExtMacOS};
 
-#[derive(Default)]
 struct BrowserStore {
     store: Option<Retained<objc2_web_kit::WKWebsiteDataStore>>,
+    profile: BrowserProfileMode,
     preview_hosts: std::collections::BTreeSet<String>,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct BrowserData(Rc<RefCell<BrowserStore>>);
 impl BrowserData {
+    pub(super) fn new(profile: BrowserProfileMode) -> Self {
+        if let BrowserProfileMode::Persistent(storage) = &profile {
+            if let Err(error) = storage.ensure_directories() {
+                tracing::warn!(%error, "could not create browser storage directories");
+            }
+        }
+        Self(Rc::new(RefCell::new(BrowserStore {
+            store: None,
+            profile,
+            preview_hosts: Default::default(),
+        })))
+    }
+
+    pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
+        let data = self.clone();
+        cx.spawn(async move {
+            let mtm = MainThreadMarker::new().ok_or_else(|| {
+                "Browser data clear must run on the main thread. Try again.".to_string()
+            })?;
+            let store = data.ensure_store(mtm)?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            unsafe {
+                use block2::RcBlock;
+                use objc2_foundation::NSDate;
+                let types = objc2_web_kit::WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+                let past = NSDate::distantPast();
+                let block = RcBlock::new(move || {
+                    let _ = tx.send(Ok(()));
+                });
+                store.removeDataOfTypes_modifiedSince_completionHandler(&types, &past, &block);
+            }
+            rx.await
+                .map_err(|_| "Browser data clear did not finish".to_string())?
+        })
+    }
+
+    fn open_store(
+        &self,
+        mtm: MainThreadMarker,
+        profile: BrowserProfileMode,
+    ) -> Result<Retained<objc2_web_kit::WKWebsiteDataStore>, String> {
+        Ok(unsafe {
+            match profile {
+                BrowserProfileMode::Deferred => {
+                    objc2_web_kit::WKWebsiteDataStore::nonPersistentDataStore(mtm)
+                }
+                BrowserProfileMode::Persistent(storage) => {
+                    use objc2_foundation::NSUUID;
+                    let uuid = NSUUID::from_bytes(storage.store_uuid().into_bytes());
+                    objc2_web_kit::WKWebsiteDataStore::dataStoreForIdentifier(&uuid, mtm)
+                }
+            }
+        })
+    }
+
+    fn ensure_store(
+        &self,
+        mtm: MainThreadMarker,
+    ) -> Result<Retained<objc2_web_kit::WKWebsiteDataStore>, String> {
+        let profile = self.0.borrow().profile.clone();
+        let mut state = self.0.borrow_mut();
+        if state.store.is_none() {
+            let store = self.open_store(mtm, profile)?;
+            if let Err(error) = configure_preview_proxy(&store, &state.preview_hosts) {
+                tracing::warn!(%error, "preview hostname proxy unavailable");
+            }
+            state.store = Some(store);
+        }
+        state
+            .store
+            .clone()
+            .ok_or_else(|| "Browser store unavailable".into())
+    }
+
     fn configuration(
         &self,
         mtm: MainThreadMarker,
-    ) -> Retained<objc2_web_kit::WKWebViewConfiguration> {
-        let mut data = self.0.borrow_mut();
-        if data.store.is_none() {
-            data.store =
-                Some(unsafe { objc2_web_kit::WKWebsiteDataStore::nonPersistentDataStore(mtm) });
-            if let Err(error) =
-                configure_preview_proxy(data.store.as_ref().unwrap(), &data.preview_hosts)
-            {
-                tracing::warn!(%error, "preview hostname proxy unavailable");
-            }
-        }
+    ) -> Result<Retained<objc2_web_kit::WKWebViewConfiguration>, String> {
+        let store = self.ensure_store(mtm)?;
         let configuration = unsafe { objc2_web_kit::WKWebViewConfiguration::new(mtm) };
         unsafe {
-            configuration.setWebsiteDataStore(data.store.as_ref().unwrap());
+            configuration.setWebsiteDataStore(&store);
         }
-        configuration
+        Ok(configuration)
     }
     pub(super) fn register_preview(&self, address: &str) {
         let Ok(url) = url::Url::parse(address) else {
@@ -89,7 +153,7 @@ fn configure_preview_proxy(
         return Ok(());
     }
     use objc2_foundation::{NSArray, NSObject};
-    use std::ffi::{CStr, CString, c_char};
+    use std::ffi::{c_char, CStr, CString};
     unsafe {
         let supported: bool = msg_send![store, respondsToSelector: sel!(setProxyConfigurations:)];
         if !supported {
@@ -295,10 +359,9 @@ impl NativePage {
         let mtm = MainThreadMarker::new().ok_or("Browser must be created on the main thread")?;
         let new_tab = tx.clone();
         let web = wry::WebViewBuilder::new()
-            .with_webview_configuration(data.configuration(mtm))
+            .with_webview_configuration(data.configuration(mtm)?)
             .with_visible(false)
             .with_focused(false)
-            .with_incognito(true)
             .with_new_window_req_handler(move |url, _| {
                 if allowed_navigation(&url) {
                     let _ = new_tab.try_send(NativeEvent::NewTab(url));

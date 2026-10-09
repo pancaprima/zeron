@@ -632,10 +632,25 @@ impl Render for BrowserSurface {
         .when(has_page, |el| {
             el.on_click(cx.listener(|this, _, _, cx| this.open_external(cx)))
         });
+        let can_clear =
+            self.context.can_clear_website_data() && !self.context.is_clearing();
+        let clear = button(
+            "browser-clear-data",
+            "Clear browser data",
+            icons::MORE_HORIZONTAL,
+            can_clear,
+            &theme,
+            cx,
+        ).when(can_clear, |el| {
+            el.on_click(cx.listener(|this, _, _, cx| {
+                cx.emit(BrowserEvent::RequestClearBrowserData);
+            }))
+        });
         let toolbar = surface_chrome::toolbar(&theme)
             .when(!external, |el| el.child(back).child(forward).child(reload))
             .child(address)
-            .child(open);
+            .child(open)
+            .child(clear);
 
         let body = div()
             .id("browser-page")

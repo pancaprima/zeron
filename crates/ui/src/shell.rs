@@ -1974,6 +1974,9 @@ pub struct Shell {
     browser_seq: u64,
     browser_context: crate::browser::BrowserContext,
     browser_profile: Option<String>,
+    browser_clear_confirm: bool,
+    browser_clear_error: Option<String>,
+    browser_clear_task: Option<gpui::Task<()>>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -2434,6 +2437,9 @@ impl Shell {
             browser_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
+            browser_clear_confirm: false,
+            browser_clear_error: None,
+            browser_clear_task: None,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -3610,6 +3616,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.browser_context.is_clearing() {
+            return;
+        }
         if self.active_chat.is_empty() {
             return;
         }
@@ -3635,6 +3644,12 @@ impl Shell {
         let sub = cx.subscribe_in(&browser, window, move |this, _, event, window, cx| {
             match event {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
+                crate::browser::BrowserEvent::RequestClearBrowserData => {
+                    if this.browser_clear_task.is_none() {
+                        this.browser_clear_confirm = true;
+                        cx.notify();
+                    }
+                }
                 crate::browser::BrowserEvent::NewTab(url) => {
                     // A background page cannot open a tab in the wrong session.
                     if this.panel_key(cx) == owner
@@ -3662,6 +3677,59 @@ impl Shell {
                 browser.focus_address(window, cx);
             }
         });
+    }
+
+    fn confirm_browser_clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser_clear_confirm = false;
+        if self.browser_clear_task.is_some() {
+            return;
+        }
+        if !self.browser_context.can_clear_website_data() {
+            self.browser_clear_error = Some(
+                "Browser data can only be cleared after your workspace identity is ready.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let profile_snapshot = self.browser_profile.clone();
+        let reloads = self
+            .browsers
+            .iter()
+            .map(|(id, browser)| {
+                let url = browser.read(cx).page.url.clone();
+                browser.update(cx, |browser, cx| browser.close(cx));
+                (*id, url)
+            })
+            .collect::<Vec<_>>();
+        let context = self.browser_context.clone();
+        context.set_clearing(true);
+        self.browser_clear_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = context.clear_website_data(cx).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                context.set_clearing(false);
+                this.browser_clear_task = None;
+                if this.browser_profile != profile_snapshot {
+                    this.browser_clear_error = Some(
+                        "Browser profile changed before clear finished. Open tabs again if needed."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                this.browser_clear_error = result.err();
+                if result.is_ok() {
+                    for (id, _) in reloads {
+                        if let Some(browser) = this.browsers.get(&id) {
+                            browser.update(cx, |browser, window, cx| {
+                                browser.reload_after_data_clear(window, cx);
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
@@ -10103,6 +10171,63 @@ impl Shell {
             overlays.push(overlay);
         }
 
+        if self.browser_clear_confirm {
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Clear browser data?"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    "This removes cookies, cache, and site storage for the current browser profile across all sites. Websites may sign you out. All browser tabs in this profile are affected.",
+                )))
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "browser-clear-cancel")
+                                .id("browser-clear-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser_clear_confirm = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_danger(&theme, "Clear browser data")
+                                .id("browser-clear-confirm")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_browser_clear(window, cx);
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("browser-clear-dialog", viewport, card));
+        }
+
+        if let Some(error) = self.browser_clear_error.clone() {
+            let card = popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Could not clear browser data"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .child(
+                            popover::btn_primary(&theme, "OK")
+                                .id("browser-clear-error-dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.browser_clear_error = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element();
+            overlays.push(popover::modal("browser-clear-error-dialog", viewport, card));
+        }
+
         if let Some(chat_id) = self.delete_confirm.clone() {
             let title = transcript::single_line(
                 &self
@@ -12736,16 +12861,23 @@ impl Render for Shell {
                 state.local_device_id.as_deref(),
             )
         };
-        if browser_profile.is_some() && browser_profile != self.browser_profile {
-            if self.browser_profile.is_some() {
+        if browser_profile != self.browser_profile {
+            if self.browser_profile.is_some() || !self.browsers.is_empty() {
                 for browser in self.browsers.values() {
                     browser.update(cx, |browser, cx| browser.close(cx));
                 }
                 self.browsers.clear();
                 self.browser_subs.clear();
-                self.browser_context = crate::browser::BrowserContext::default();
             }
-            self.browser_profile = browser_profile;
+            self.browser_profile = browser_profile.clone();
+            self.browser_context = match browser_profile {
+                Some(locator) => crate::browser::BrowserContext::persistent(&self.data_dir, &locator)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, "browser profile storage unavailable");
+                        crate::browser::BrowserContext::default()
+                    }),
+                None => crate::browser::BrowserContext::default(),
+            };
         }
         let browser_active = matches!(gate, GatePhase::Ready)
             && !restart_required

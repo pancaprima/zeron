@@ -470,9 +470,38 @@ static void evaluated(GObject *web, GAsyncResult *result, gpointer data) {
     g_clear_object(&v);
     g_clear_error(&error);
 }
+static void clear_done(GObject *source, GAsyncResult *result, gpointer unused) {
+    GError *error = NULL;
+    webkit_website_data_manager_clear_finish(WEBKIT_WEBSITE_DATA_MANAGER(source), result, &error);
+    if (error) {
+        gchar *message = g_strdup_printf("err:%s", error->message);
+        send_packet('D', 0, message, strlen(message));
+        g_free(message);
+        g_clear_error(&error);
+        return;
+    }
+    send_packet('D', 0, "ok", 2);
+}
+
 static void command(JsonObject *o) {
     guint id = number(o, "id");
     const char *cmd = string(o, "cmd");
+    if (!strcmp(cmd, "clear-data")) {
+        WebKitWebsiteDataManager *manager =
+            webkit_web_context_get_website_data_manager(context);
+#ifdef WEBKIT_WEBSITE_DATA_ALL
+        WebKitWebsiteDataTypes clear_types = WEBKIT_WEBSITE_DATA_ALL;
+#else
+        WebKitWebsiteDataTypes clear_types =
+            WEBKIT_WEBSITE_DATA_MEMORY_CACHE | WEBKIT_WEBSITE_DATA_DISK_CACHE |
+            WEBKIT_WEBSITE_DATA_OFFLINE_APPLICATION_CACHE |
+            WEBKIT_WEBSITE_DATA_SESSION_STORAGE | WEBKIT_WEBSITE_DATA_LOCAL_STORAGE |
+            WEBKIT_WEBSITE_DATA_INDEXEDDB_DATABASES | WEBKIT_WEBSITE_DATA_COOKIES;
+#endif
+        webkit_website_data_manager_clear(manager, clear_types, 0, NULL, clear_done,
+                                          manager);
+        return;
+    }
     Page *p = g_hash_table_lookup(pages, GUINT_TO_POINTER(id));
     if (!strcmp(cmd, "create")) {
         if (!p)
@@ -616,7 +645,24 @@ int main(int argc, char **argv) {
     }
     pages = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_page);
     input = g_byte_array_new();
-    context = webkit_web_context_new_ephemeral();
+    const char *data_dir = g_getenv("ZERON_BROWSER_DATA_DIR");
+    const char *cache_dir = g_getenv("ZERON_BROWSER_CACHE_DIR");
+    if (data_dir && cache_dir && *data_dir && *cache_dir) {
+        g_mkdir_with_parents(data_dir, 0700);
+        g_mkdir_with_parents(cache_dir, 0700);
+        WebKitWebsiteDataManager *manager = g_object_new(
+            WEBKIT_TYPE_WEBSITE_DATA_MANAGER, "base-data-directory", data_dir,
+            "base-cache-directory", cache_dir, NULL);
+        gchar *cookie_path = g_build_filename(data_dir, "cookies.sqlite", NULL);
+        webkit_cookie_manager_set_persistent_storage(
+            webkit_website_data_manager_get_cookie_manager(manager), cookie_path,
+            WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+        g_free(cookie_path);
+        context = webkit_web_context_new_with_website_data_manager(manager);
+        g_object_unref(manager);
+    } else {
+        context = webkit_web_context_new_ephemeral();
+    }
     g_signal_connect(context, "download-started", G_CALLBACK(download), NULL);
     g_unix_fd_add(STDIN_FILENO, G_IO_IN | G_IO_HUP | G_IO_ERR, read_commands, NULL);
     g_timeout_add(16, render_frames, NULL);

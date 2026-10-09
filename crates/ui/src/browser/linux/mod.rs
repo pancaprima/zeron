@@ -1,16 +1,17 @@
 //! WebKitGTK renders offscreen in an isolated helper process. GPUI composites
 //! its frames, so browser content uses the same clipping and blur as other UI.
 use super::model::{PageState, Presentation};
+use super::profile::BrowserProfileMode;
 use gpui::{Bounds, Pixels, RenderImage};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc, Mutex, Weak,
         atomic::{AtomicU32, Ordering},
+        Arc, Mutex, Weak,
     },
 };
 use tokio::sync::mpsc::Sender;
@@ -24,14 +25,18 @@ pub enum NativeEvent {
     Menu(Value),
 }
 
-#[derive(Clone, Default)]
-pub struct BrowserData(Arc<Mutex<Weak<Worker>>>);
+#[derive(Clone)]
+pub struct BrowserData {
+    worker: Arc<Mutex<Weak<Worker>>>,
+    profile: BrowserProfileMode,
+}
 
 struct Worker {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     routes: Arc<Mutex<HashMap<u32, Weak<Route>>>>,
     next_id: AtomicU32,
+    clear_waiter: Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -83,8 +88,30 @@ fn helper_path() -> Result<std::path::PathBuf, String> {
     Ok(path)
 }
 impl BrowserData {
+    pub fn new(profile: BrowserProfileMode) -> Self {
+        Self {
+            worker: Arc::new(Mutex::new(Weak::new())),
+            profile,
+        }
+    }
+
+    pub fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
+        let data = self.clone();
+        cx.spawn(async move {
+            let worker = data.worker()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *worker.clear_waiter.lock().unwrap() = Some(tx);
+            worker.send_global(json!({"cmd": "clear-data"}))?;
+            match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("Browser helper stopped during clear".into()),
+                Err(_) => Err("Browser data clear timed out".into()),
+            }
+        })
+    }
+
     fn worker(&self) -> Result<Arc<Worker>, String> {
-        let mut current = self.0.lock().unwrap();
+        let mut current = self.worker.lock().unwrap();
         if let Some(worker) = current.upgrade() {
             if worker
                 .child
@@ -97,12 +124,29 @@ impl BrowserData {
                 return Ok(worker);
             }
         }
-        let mut child = Command::new(helper_path()?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+        let mut command = Command::new(helper_path()?);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if let BrowserProfileMode::Persistent(storage) = &self.profile {
+            storage
+                .ensure_directories()
+                .map_err(|error| error.to_string())?;
+            command.env("ZERON_BROWSER_DATA_DIR", storage.webkit_data_dir());
+            command.env("ZERON_BROWSER_CACHE_DIR", storage.webkit_cache_dir());
+        }
+        let mut child = command
+            .spawn()
             .map_err(|e| format!("Could not start WebKitGTK: {e}. Install the WebKitGTK 4.1 runtime for your distribution."))?;
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         let routes: Arc<Mutex<HashMap<u32, Weak<Route>>>> = Arc::default();
         let reader_routes = routes.clone();
+        let clear_waiter = Arc::new(Mutex::new(
+            None::<tokio::sync::oneshot::Sender<Result<(), String>>>,
+        ));
+        let reader_clear = clear_waiter.clone();
         std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
             let result = (|| -> std::io::Result<()> {
                 loop {
@@ -111,6 +155,18 @@ impl BrowserData {
                     let length = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
                     if length > 8192 * 8192 * 4 + 12 { return Err(std::io::Error::other("Browser packet is too large")); }
                     let mut data = vec![0; length]; stdout.read_exact(&mut data)?;
+                    if header[0] == b'D' {
+                        if let Some(tx) = reader_clear.lock().unwrap().take() {
+                            let message = String::from_utf8_lossy(&data);
+                            let result = if message.starts_with("err:") {
+                                Err(message.to_string())
+                            } else {
+                                Ok(())
+                            };
+                            let _ = tx.send(result);
+                        }
+                        continue;
+                    }
                     let route = reader_routes.lock().unwrap().get(&id).and_then(Weak::upgrade);
                     let Some(route) = route else { continue; };
                     let event = match header[0] {
@@ -153,6 +209,9 @@ impl BrowserData {
                 }
             })();
             if result.is_err() {
+                if let Some(tx) = reader_clear.lock().unwrap().take() {
+                    let _ = tx.send(Err("Browser helper stopped during clear".into()));
+                }
                 for route in reader_routes.lock().unwrap().values().filter_map(Weak::upgrade) {
                     let mut state = route.state.lock().unwrap();
                     state.loading = false;
@@ -166,6 +225,7 @@ impl BrowserData {
             stdin: Mutex::new(stdin),
             routes,
             next_id: AtomicU32::new(1),
+            clear_waiter,
         });
         *current = Arc::downgrade(&worker);
         Ok(worker)
@@ -179,6 +239,10 @@ impl Worker {
         pipe.write_all(&(data.len() as u32).to_le_bytes())
             .and_then(|_| pipe.write_all(&data))
             .map_err(|e| e.to_string())
+    }
+
+    fn send_global(&self, command: Value) -> Result<(), String> {
+        self.send(0, command)
     }
 }
 
@@ -630,7 +694,7 @@ impl super::BrowserSurface {
         cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let theme = &theme.for_popup();
-        use gpui::{IntoElement, div, prelude::*, px};
+        use gpui::{div, prelude::*, px, IntoElement};
         let native = self.native.as_ref()?;
         let menu = native.menu.as_ref()?;
         let items = menu["items"].as_array()?;
