@@ -3,6 +3,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+mod macos_persistence_diag;
 #[cfg(target_os = "linux")]
 use linux as native;
 #[cfg(target_os = "macos")]
@@ -728,6 +730,17 @@ impl BrowserSurface {
     #[cfg(target_os = "macos")]
     pub fn fixture_geometry(&self) -> (f32, f32, f32) {
         self.native.as_ref().unwrap().fixture_geometry()
+    }
+    #[cfg(all(target_os = "macos", feature = "browser-fixture"))]
+    pub fn fixture_native_cookie_diag(
+        &self,
+        cookie_name: &str,
+        cx: &App,
+    ) -> gpui::Task<Result<String, String>> {
+        match self.native.as_ref() {
+            Some(native) => native.fixture_native_cookie_diag(cookie_name, cx),
+            None => gpui::Task::ready(Err("browser native page missing".to_string())),
+        }
     }
     pub fn fixture_eval(&self, script: &str) {
         #[cfg(target_os = "macos")]

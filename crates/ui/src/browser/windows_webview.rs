@@ -160,10 +160,11 @@ impl BrowserData {
         profile: ICoreWebView2Profile2,
         tx: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) -> Result<(), String> {
-        let slot = std::sync::Mutex::new(Some(tx));
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        let slot_for_handler = slot.clone();
         let handler = webview2_com::ClearBrowsingDataCompletedHandler::create(Box::new(
             move |result| {
-                if let Some(tx) = slot.lock().unwrap().take() {
+                if let Some(tx) = slot_for_handler.lock().unwrap().take() {
                     let _ = tx.send(result.map_err(|error| runtime_error(&error)).map(|_| ()));
                 }
                 Ok(())

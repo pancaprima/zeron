@@ -70,6 +70,28 @@ fn log_persistence_boundary(
     Ok(())
 }
 
+async fn log_native_cookie_diag(
+    phase: &str,
+    browser: &gpui::Entity<BrowserSurface>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    if std::env::consts::OS != "macos" {
+        return Ok(());
+    }
+    let task = browser.update(cx, |b, cx| b.fixture_native_cookie_diag(COOKIE_NAME, cx))?;
+    let deadline = cx.background_executor().timer(Duration::from_secs(15));
+    let line = match futures::future::select(Box::pin(task), Box::pin(deadline)).await {
+        futures::future::Either::Left((result, _)) => {
+            result.map_err(|error| anyhow::anyhow!("{phase}: {error}"))?
+        }
+        futures::future::Either::Right((_, _)) => {
+            anyhow::bail!("{phase}: native cookie diag timed out");
+        }
+    };
+    eprintln!("persistence-diag phase={phase} {line}");
+    Ok(())
+}
+
 async fn wait_for_storage_probe(
     browser: &gpui::Entity<BrowserSurface>,
     context: &str,
@@ -97,6 +119,12 @@ async fn wait_for_storage_probe(
                     probe.cookie == want_cookie && probe.local_storage == want_local_storage;
                 if !satisfied {
                     if want_cookie && want_local_storage && (probe.cookie ^ probe.local_storage) {
+                        log_native_cookie_diag(
+                            &format!("{context}:native-on-failure"),
+                            browser,
+                            cx,
+                        )
+                        .await?;
                         anyhow::bail!(persistence_probe::storage_probe_error(context, probe));
                     }
                     if !want_cookie && !want_local_storage && !probe.both_absent() {
@@ -179,6 +207,7 @@ async fn write_storage(
     )
     .await?;
     log_persistence_boundary("write-storage:after-readback", origin, window, cx)?;
+    log_native_cookie_diag("write-storage:after-readback-native", browser, cx).await?;
     pause(cx, 300).await;
     Ok(())
 }

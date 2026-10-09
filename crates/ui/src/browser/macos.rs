@@ -45,6 +45,23 @@ impl BrowserData {
         })))
     }
 
+    #[cfg(feature = "browser-fixture")]
+    pub(super) fn fixture_native_cookie_diag(
+        &self,
+        cookie_name: &str,
+        cx: &gpui::App,
+    ) -> gpui::Task<Result<String, String>> {
+        let data = self.clone();
+        let cookie_name = cookie_name.to_string();
+        cx.spawn(async move |_cx| {
+            let mtm = MainThreadMarker::new().ok_or_else(|| {
+                "Native cookie diagnostics must run on the main thread.".to_string()
+            })?;
+            let store = data.ensure_store(mtm)?;
+            super::macos_persistence_diag::native_cookie_diag_line(store, cookie_name).await
+        })
+    }
+
     pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
         #[cfg(feature = "browser-fixture")]
         if std::env::var_os("ZERON_BROWSER_FIXTURE_INJECT_CLEAR_ERROR").is_some() {
@@ -897,5 +914,16 @@ impl NativePage {
                 .view
                 .evaluateJavaScript_completionHandler(&NSString::from_str(script), None);
         }
+    }
+    #[cfg(feature = "browser-fixture")]
+    pub fn fixture_native_cookie_diag(
+        &self,
+        cookie_name: &str,
+        cx: &gpui::App,
+    ) -> gpui::Task<Result<String, String>> {
+        self.0
+            .borrow()
+            .data
+            .fixture_native_cookie_diag(cookie_name, cx)
     }
 }
