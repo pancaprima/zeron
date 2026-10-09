@@ -3717,15 +3717,18 @@ impl Shell {
                     cx.notify();
                     return;
                 }
-                this.browser_clear_error = result.err();
-                if result.is_ok() {
-                    for (id, _) in reloads {
-                        if let Some(browser) = this.browsers.get(&id) {
-                            browser.update(cx, |browser, cx| {
-                                browser.reload_after_data_clear(window, cx);
-                            });
+                match result {
+                    Ok(()) => {
+                        this.browser_clear_error = None;
+                        for (id, _) in reloads {
+                            if let Some(browser) = this.browsers.get(&id) {
+                                browser.update(cx, |browser, cx| {
+                                    browser.reload_after_data_clear(window, cx);
+                                });
+                            }
                         }
                     }
+                    Err(error) => this.browser_clear_error = Some(error),
                 }
                 cx.notify();
             });

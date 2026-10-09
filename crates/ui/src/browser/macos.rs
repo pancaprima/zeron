@@ -56,10 +56,14 @@ impl BrowserData {
             unsafe {
                 use block2::RcBlock;
                 use objc2_foundation::NSDate;
+                use std::sync::Mutex;
                 let types = objc2_web_kit::WKWebsiteDataStore::allWebsiteDataTypes(mtm);
                 let past = NSDate::distantPast();
+                let reply = Mutex::new(Some(tx));
                 let block = RcBlock::new(move || {
-                    let _ = tx.send(Ok(()));
+                    if let Some(tx) = reply.lock().unwrap().take() {
+                        let _ = tx.send(Ok(()));
+                    }
                 });
                 store.removeDataOfTypes_modifiedSince_completionHandler(&types, &past, &block);
             }
