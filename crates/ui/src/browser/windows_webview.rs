@@ -120,8 +120,9 @@ impl BrowserData {
         let data = self.clone();
         cx.spawn(async move |_cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let data_for_clear = data.clone();
             data.with_environment(move |environment| match environment {
-                Ok(environment) => match data.browsing_profile_for_clear(&environment) {
+                Ok(environment) => match data_for_clear.browsing_profile_for_clear(&environment) {
                     Ok(profile) => {
                         let _ = BrowserData::clear_profile_data(profile, tx);
                     }
@@ -148,7 +149,11 @@ impl BrowserData {
         if let Some(profile) = self.0.borrow().browsing_profile.clone() {
             return Ok(profile);
         }
-        profile_for_clear(environment, &self.profile())
+        let _ = environment;
+        Err(
+            "Clearing browser data requires an active browser page (WebView2 profile handle unavailable)."
+                .to_string(),
+        )
     }
 
     fn clear_profile_data(
@@ -159,7 +164,7 @@ impl BrowserData {
         let handler = webview2_com::ClearBrowsingDataCompletedHandler::create(Box::new(
             move |result| {
                 if let Some(tx) = slot.lock().unwrap().take() {
-                    let _ = tx.send(result.map_err(runtime_error).map(|_| ()));
+                    let _ = tx.send(result.map_err(|error| runtime_error(&error)).map(|_| ()));
                 }
                 Ok(())
             },
@@ -297,24 +302,6 @@ fn resolved_user_data_folder(state: &EnvironmentState) -> std::path::PathBuf {
     } else {
         state.user_data_dir.clone()
     }
-}
-
-fn profile_for_clear(
-    environment: &ICoreWebView2Environment,
-    profile_name: &str,
-) -> Result<ICoreWebView2Profile2, String> {
-    let environment = environment
-        .cast::<ICoreWebView2Environment11>()
-        .map_err(|_| {
-            "Clearing browser data requires WebView2 Runtime 109 or newer (ICoreWebView2Environment11)."
-                .to_string()
-        })?;
-    let profile = environment
-        .CreateCoreWebView2Profile(&HSTRING::from(profile_name))
-        .map_err(runtime_error)?;
-    profile
-        .cast::<ICoreWebView2Profile2>()
-        .map_err(|error| runtime_error(&error))
 }
 
 fn create_environment(shared: std::rc::Weak<RefCell<EnvironmentState>>) {
@@ -715,7 +702,7 @@ impl Host {
         let controller: ICoreWebView2Controller = composition.cast()?;
         let webview = unsafe { controller.CoreWebView2()? };
         if let Ok(webview13) = webview.cast::<ICoreWebView2_13>() {
-            if let Ok(profile) = webview13.Profile() {
+            if let Ok(profile) = unsafe { webview13.Profile() } {
                 if let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() {
                     host.data.0.borrow_mut().browsing_profile = Some(profile2);
                 }

@@ -12,6 +12,8 @@ mod windows_webview;
 #[cfg(windows)]
 use windows_webview as native;
 pub mod model;
+#[cfg(any(feature = "browser-fixture", test))]
+pub mod persistence_probe;
 mod profile;
 mod view;
 
@@ -790,23 +792,18 @@ mod tests {
     #[gpui::test]
     #[test]
     fn persistent_context_is_scoped_to_locator() {
-        let dir = std::path::PathBuf::from(
-            "/root/.hermes/profiles/girlfriend/cache/scratch/zeron-browser-context-test",
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        let context = BrowserContext::persistent(&dir, "0123456789abcdef").unwrap();
+        let dir = profile::test_dirs::UniqueTestDir::new("browser-context").unwrap();
+        let context = BrowserContext::persistent(dir.path(), "0123456789abcdef").unwrap();
         assert!(context.can_clear_website_data());
         let storage = context.profile_mode().storage().unwrap();
         assert_eq!(storage.locator, "0123456789abcdef");
-        assert!(storage.storage_root().starts_with(&dir));
+        assert!(storage.storage_root().starts_with(dir.path()));
     }
 
     #[test]
     fn persistent_context_rejects_bad_locator() {
-        let dir = std::path::PathBuf::from(
-            "/root/.hermes/profiles/girlfriend/cache/scratch/zeron-browser-context-test",
-        );
-        assert!(BrowserContext::persistent(&dir, "not-a-valid-locator").is_err());
+        let dir = profile::test_dirs::UniqueTestDir::new("browser-context-bad").unwrap();
+        assert!(BrowserContext::persistent(dir.path(), "not-a-valid-locator").is_err());
     }
 
     #[test]

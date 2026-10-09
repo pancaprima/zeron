@@ -3,13 +3,17 @@
 //! Real WebKit storage across process relaunch, identity isolation, and clear UI.
 //! Invoked when `ZERON_BROWSER_PERSISTENCE_PHASE` is set; never touches user data.
 
-use super::loopback::{persistence_port, start, LoopbackSite};
-use gpui::{px, size, AppContext, AsyncApp, Bounds, WindowBounds, WindowOptions, WindowHandle};
+use super::loopback::{LoopbackSite, persistence_port, start};
+use gpui::{AppContext, AsyncApp, Bounds, WindowBounds, WindowHandle, WindowOptions, px, size};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use zeron_ui::{browser::BrowserSurface, shell::Shell, *};
+use zeron_ui::{
+    browser::{BrowserSurface, persistence_probe},
+    shell::Shell,
+    *,
+};
 
 pub const COOKIE_NAME: &str = "zeron_persist_fixture";
 pub const LS_KEY: &str = "zeron_persist_fixture";
@@ -45,48 +49,65 @@ fn write_success(output: &Path, message: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn persist_script() -> String {
-    format!(
-        "document.cookie = '{name}={value}; path=/; max-age=31536000'; \
-         localStorage.setItem('{ls}', '{value}'); \
-         document.title = 'persist-ready';",
-        name = COOKIE_NAME,
-        value = MARKER_VALUE,
-        ls = LS_KEY,
-    )
+fn persist_write_script(nonce: &str) -> anyhow::Result<String> {
+    persistence_probe::persist_write_script(COOKIE_NAME, MARKER_VALUE, LS_KEY, nonce)
+        .map_err(anyhow::Error::msg)
 }
 
-fn verify_script() -> String {
-    format!(
-        "(function() {{ \
-         var cookieOk = document.cookie.includes('{name}={value}'); \
-         var lsOk = localStorage.getItem('{ls}') === '{value}'; \
-         if (cookieOk && lsOk) document.title = 'persist-verified'; \
-         else if (!cookieOk && !lsOk) document.title = 'persist-missing'; \
-         else document.title = 'persist-partial'; \
-         }})();",
-        name = COOKIE_NAME,
-        value = MARKER_VALUE,
-        ls = LS_KEY,
-    )
+fn persist_read_probe_script(nonce: &str) -> anyhow::Result<String> {
+    persistence_probe::persist_read_probe_script(COOKIE_NAME, MARKER_VALUE, LS_KEY, nonce)
+        .map_err(anyhow::Error::msg)
 }
 
-async fn wait_for_title(
+fn log_persistence_boundary(
+    phase: &str,
+    origin: &str,
+    window: WindowHandle<Shell>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    let profile = window.update(cx, |shell, _, _| shell.fixture_browser_persistence_diag())?;
+    eprintln!("persistence-diag phase={phase} origin={origin} profile={profile}");
+    Ok(())
+}
+
+async fn wait_for_storage_probe(
     browser: &gpui::Entity<BrowserSurface>,
-    title: &str,
+    context: &str,
+    probe_nonce: &str,
+    want_cookie: bool,
+    want_local_storage: bool,
     timeout: Duration,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + timeout;
-    while browser.read_with(cx, |b, _| b.page.title != title) {
-        let got = browser.read_with(cx, |b, _| b.page.title.clone());
-        anyhow::ensure!(
-            got != "persist-partial",
-            "storage assertion requires both cookie and localStorage in sync; got partial state"
-        );
+    while !browser.read_with(cx, |b, _| {
+        persistence_probe::probe_satisfied(
+            &b.page.title,
+            probe_nonce,
+            want_cookie,
+            want_local_storage,
+        )
+    }) {
+        let title = browser.read_with(cx, |b, _| b.page.title.clone());
+        if let Some(probe) = persistence_probe::parse_probe_title(&title) {
+            if probe.nonce != probe_nonce {
+                // Stale probe from a prior navigation or evaluation.
+            } else {
+                let satisfied =
+                    probe.cookie == want_cookie && probe.local_storage == want_local_storage;
+                if !satisfied {
+                    if want_cookie && want_local_storage && (probe.cookie ^ probe.local_storage) {
+                        anyhow::bail!(persistence_probe::storage_probe_error(context, probe));
+                    }
+                    if !want_cookie && !want_local_storage && !probe.both_absent() {
+                        anyhow::bail!(persistence_probe::storage_probe_error(context, probe));
+                    }
+                }
+            }
+        }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for page title `{title}` (got `{got}`)"
+            "{context}: timed out waiting for storage probe nonce={probe_nonce} cookie={want_cookie} localStorage={want_local_storage} (title=`{title}`)"
         );
         pause(cx, 50).await;
     }
@@ -122,10 +143,7 @@ async fn open_browser(
     window.update(cx, |shell, w, cx| shell.fixture_open_browser(None, w, cx))
 }
 
-async fn wait_clear_idle(
-    window: WindowHandle<Shell>,
-    cx: &mut AsyncApp,
-) -> anyhow::Result<()> {
+async fn wait_clear_idle(window: WindowHandle<Shell>, cx: &mut AsyncApp) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let busy = window.update(cx, |shell, _, _| {
@@ -145,9 +163,22 @@ async fn write_storage(
     origin: &str,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
+    log_persistence_boundary("write-storage:before", origin, window, cx)?;
     load_origin(window, browser, origin, cx).await?;
-    browser.read_with(cx, |b, _| b.fixture_eval(&persist_script()));
-    wait_for_title(browser, "persist-ready", Duration::from_secs(15), cx).await?;
+    let probe_nonce = persistence_probe::new_probe_nonce();
+    let script = persist_write_script(&probe_nonce)?;
+    browser.read_with(cx, |b, _| b.fixture_eval(&script));
+    wait_for_storage_probe(
+        browser,
+        "write-storage readback",
+        &probe_nonce,
+        true,
+        true,
+        Duration::from_secs(15),
+        cx,
+    )
+    .await?;
+    log_persistence_boundary("write-storage:after-readback", origin, window, cx)?;
     pause(cx, 300).await;
     Ok(())
 }
@@ -159,18 +190,39 @@ async fn expect_storage(
     present: bool,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
-    load_origin(window, browser, origin, cx).await?;
-    browser.read_with(cx, |b, _| b.fixture_eval(&verify_script()));
-    let want = if present {
-        "persist-verified"
+    let context = if present {
+        "restart-verify"
     } else {
-        "persist-missing"
+        "storage-absent-check"
     };
-    wait_for_title(browser, want, Duration::from_secs(15), cx).await?;
+    log_persistence_boundary(context, origin, window, cx)?;
+    load_origin(window, browser, origin, cx).await?;
+    let probe_nonce = persistence_probe::new_probe_nonce();
+    let script = persist_read_probe_script(&probe_nonce)?;
+    browser.read_with(cx, |b, _| b.fixture_eval(&script));
+    let (want_cookie, want_ls) = if present {
+        (true, true)
+    } else {
+        (false, false)
+    };
+    wait_for_storage_probe(
+        browser,
+        context,
+        &probe_nonce,
+        want_cookie,
+        want_ls,
+        Duration::from_secs(15),
+        cx,
+    )
+    .await?;
     Ok(())
 }
 
-fn write_relaunch_marker(root: &Path, site: &LoopbackSite) -> anyhow::Result<()> {
+fn write_relaunch_marker(
+    root: &Path,
+    site: &LoopbackSite,
+    profile_diag: &str,
+) -> anyhow::Result<()> {
     std::fs::create_dir_all(root)?;
     std::fs::write(
         root.join("relaunch-marker.json"),
@@ -181,6 +233,7 @@ fn write_relaunch_marker(root: &Path, site: &LoopbackSite) -> anyhow::Result<()>
             "localStorageKey": LS_KEY,
             "markerValue": MARKER_VALUE,
             "deviceA": DEVICE_A,
+            "profileDiag": profile_diag,
         }))?,
     )?;
     Ok(())
@@ -194,7 +247,8 @@ fn require_relaunch_marker(root: &Path) -> anyhow::Result<serde_json::Value> {
         path.display()
     );
     let contents = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&contents).map_err(|error| anyhow::anyhow!("invalid relaunch marker: {error}"))
+    serde_json::from_str(&contents)
+        .map_err(|error| anyhow::anyhow!("invalid relaunch marker: {error}"))
 }
 
 fn require_marker_origin<'a>(marker: &'a serde_json::Value) -> anyhow::Result<&'a str> {
@@ -256,13 +310,17 @@ pub async fn run_phase(
     let site = start(port)?;
     match phase {
         "relaunch-write" => {
+            log_persistence_boundary("relaunch-write:start", &site.origin, window, cx)?;
             let marker_path = root.join("relaunch-marker.json");
             if marker_path.is_file() {
                 std::fs::remove_file(&marker_path)?;
             }
             let (_id, browser) = open_browser(window, cx).await?;
             write_storage(window, &browser, &site.origin, cx).await?;
-            write_relaunch_marker(root, &site)?;
+            let profile_diag =
+                window.update(cx, |shell, _, _| shell.fixture_browser_persistence_diag())?;
+            write_relaunch_marker(root, &site, &profile_diag)?;
+            log_persistence_boundary("relaunch-write:marker-written", &site.origin, window, cx)?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id, w, cx))?;
             pause(cx, 400).await;
             write_success(
@@ -272,7 +330,11 @@ pub async fn run_phase(
         }
         "relaunch-verify" => {
             let marker = require_relaunch_marker(root)?;
+            if let Some(diag) = marker.get("profileDiag").and_then(|v| v.as_str()) {
+                eprintln!("persistence-diag phase=relaunch-verify:marker profile={diag}");
+            }
             let expected_origin = ensure_loopback_origin(&site, &marker)?;
+            log_persistence_boundary("relaunch-verify:start", expected_origin, window, cx)?;
             let (_id, browser) = open_browser(window, cx).await?;
             expect_storage(window, &browser, expected_origin, true, cx).await?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id, w, cx))?;
@@ -289,13 +351,17 @@ pub async fn run_phase(
             expect_storage(window, &browser_a, origin, true, cx).await?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_a, w, cx))?;
             pause(cx, 200).await;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_B, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_B, cx)
+            })?;
             pause(cx, 300).await;
             let (_id_b, browser_b) = open_browser(window, cx).await?;
             expect_storage(window, &browser_b, origin, false, cx).await?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b, w, cx))?;
             pause(cx, 200).await;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_A, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_A, cx)
+            })?;
             pause(cx, 300).await;
             let (_id_a2, browser_a2) = open_browser(window, cx).await?;
             expect_storage(window, &browser_a2, origin, true, cx).await?;
@@ -309,7 +375,9 @@ pub async fn run_phase(
             let origin = ensure_loopback_origin(&site, &marker)?;
             let (_id, browser) = open_browser(window, cx).await?;
             write_storage(window, &browser, origin, cx).await?;
-            window.update(cx, |shell, _, cx| shell.fixture_browser_clear_dialog(true, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_browser_clear_dialog(true, cx)
+            })?;
             pause(cx, 200).await;
             anyhow::ensure!(
                 window.update(cx, |shell, _, _| shell.fixture_browser_clear_confirm_open())?,
@@ -337,19 +405,27 @@ pub async fn run_phase(
         "clear-confirm" => {
             let marker = require_relaunch_marker(root)?;
             let origin = ensure_loopback_origin(&site, &marker)?;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_B, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_B, cx)
+            })?;
             pause(cx, 300).await;
             let (_id_b, browser_b) = open_browser(window, cx).await?;
             write_storage(window, &browser_b, origin, cx).await?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b, w, cx))?;
             pause(cx, 200).await;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_A, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_A, cx)
+            })?;
             pause(cx, 300).await;
             let (_id_a, browser_a) = open_browser(window, cx).await?;
             write_storage(window, &browser_a, origin, cx).await?;
-            window.update(cx, |shell, _, cx| shell.fixture_browser_clear_dialog(true, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_browser_clear_dialog(true, cx)
+            })?;
             pause(cx, 200).await;
-            window.update(cx, |shell, w, cx| shell.fixture_confirm_browser_clear(w, cx))?;
+            window.update(cx, |shell, w, cx| {
+                shell.fixture_confirm_browser_clear(w, cx)
+            })?;
             wait_clear_idle(window, cx).await?;
             anyhow::ensure!(
                 window
@@ -360,13 +436,19 @@ pub async fn run_phase(
             expect_storage(window, &browser_a, origin, false, cx).await?;
             window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_a, w, cx))?;
             pause(cx, 200).await;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_B, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_B, cx)
+            })?;
             pause(cx, 300).await;
             let (_id_b2, browser_b2) = open_browser(window, cx).await?;
             expect_storage(window, &browser_b2, origin, true, cx).await?;
-            window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b2, w, cx))?;
+            window.update(cx, |shell, w, cx| {
+                shell.fixture_close_browser(_id_b2, w, cx)
+            })?;
             pause(cx, 200).await;
-            window.update(cx, |shell, _, cx| shell.fixture_set_local_device_id(DEVICE_A, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_A, cx)
+            })?;
             pause(cx, 200).await;
             write_success(
                 output,
@@ -382,13 +464,19 @@ pub async fn run_phase(
             let origin = ensure_loopback_origin(&site, &marker)?;
             let (_id, browser) = open_browser(window, cx).await?;
             write_storage(window, &browser, origin, cx).await?;
-            window.update(cx, |shell, _, cx| shell.fixture_browser_clear_dialog(true, cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_browser_clear_dialog(true, cx)
+            })?;
             pause(cx, 200).await;
-            window.update(cx, |shell, w, cx| shell.fixture_confirm_browser_clear(w, cx))?;
+            window.update(cx, |shell, w, cx| {
+                shell.fixture_confirm_browser_clear(w, cx)
+            })?;
             wait_clear_idle(window, cx).await?;
             let error = window.update(cx, |shell, _, _| shell.fixture_browser_clear_error())?;
             anyhow::ensure!(
-                error.as_deref().is_some_and(|e| e.contains("Fixture-injected clear failure")),
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("Fixture-injected clear failure")),
                 "expected injected clear failure dialog, got {error:?}"
             );
             anyhow::ensure!(
@@ -400,7 +488,9 @@ pub async fn run_phase(
                 "clear remained busy after injected failure"
             );
             expect_storage(window, &browser, origin, true, cx).await?;
-            window.update(cx, |shell, _, cx| shell.fixture_dismiss_browser_clear_error(cx))?;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_dismiss_browser_clear_error(cx)
+            })?;
             pause(cx, 200).await;
             write_success(
                 output,
@@ -411,10 +501,7 @@ pub async fn run_phase(
     }
 }
 
-pub fn bootstrap_state(
-    data: PathBuf,
-    cx: &mut gpui::App,
-) -> gpui::Entity<state::AppState> {
+pub fn bootstrap_state(data: PathBuf, cx: &mut gpui::App) -> gpui::Entity<state::AppState> {
     let settings = settings::UiSettings::default();
     settings::init(settings.clone(), data.clone(), cx);
     let fonts = typography::register_fonts(cx);
@@ -472,28 +559,32 @@ pub fn bootstrap_state(
         s.auto_selected = true;
         s.chats_synced = true;
         s.spaces_synced = true;
-        s.spaces = vec![serde_json::from_value(serde_json::json!({
-            "id": "project",
-            "deviceId": DEVICE_A,
-            "path": "/tmp/fieldnotes",
-            "createdAt": "2026-09-08T00:00:00Z"
-        }))
-        .unwrap()];
-        s.chats = vec![serde_json::from_value(serde_json::json!({
-            "id": "browser-fixture",
-            "deviceId": DEVICE_A,
-            "spaceId": "project",
-            "title": "Build the Fieldnotes workspace",
-            "archived": false,
-            "createdAt": "2026-09-08T00:00:00Z",
-            "config": {
-                "harness": "claude-code",
-                "model": "claude-sonnet-4-6",
-                "reasoning": null,
-                "sandbox": "workspace-write"
-            }
-        }))
-        .unwrap()];
+        s.spaces = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "project",
+                "deviceId": DEVICE_A,
+                "path": "/tmp/fieldnotes",
+                "createdAt": "2026-09-08T00:00:00Z"
+            }))
+            .unwrap(),
+        ];
+        s.chats = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "browser-fixture",
+                "deviceId": DEVICE_A,
+                "spaceId": "project",
+                "title": "Build the Fieldnotes workspace",
+                "archived": false,
+                "createdAt": "2026-09-08T00:00:00Z",
+                "config": {
+                    "harness": "claude-code",
+                    "model": "claude-sonnet-4-6",
+                    "reasoning": null,
+                    "sandbox": "workspace-write"
+                }
+            }))
+            .unwrap(),
+        ];
         s
     })
 }
@@ -555,7 +646,9 @@ pub fn run_app(phase: &str, data: PathBuf, output: PathBuf) -> anyhow::Result<()
                     eprintln!("Browser persistence harness failed: {error:#}");
                     *result.lock().unwrap() = Some(error.to_string());
                 }
-                let _ = window.update(cx, |shell, window, cx| shell.fixture_blur_browser(window, cx));
+                let _ = window.update(cx, |shell, window, cx| {
+                    shell.fixture_blur_browser(window, cx)
+                });
                 pause(cx, 200).await;
                 drop(state);
                 let _ = window.update(cx, |_, window, _| window.remove_window());

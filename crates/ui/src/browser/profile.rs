@@ -114,29 +114,88 @@ impl BrowserProfileMode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_dirs {
     use super::*;
-    use zeron_proto::{AuthState, WorkspaceScope};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn scratch_parent() -> PathBuf {
-        PathBuf::from("/root/.hermes/profiles/girlfriend/cache/scratch")
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    pub struct UniqueTestDir {
+        path: PathBuf,
+    }
+
+    impl UniqueTestDir {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub fn new(label: &str) -> std::io::Result<Self> {
+            let label: String = label
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "zeron-browser-profile-{label}-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Ok(Self { path }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    impl Drop for UniqueTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
+    fn unique_test_dir_removed_on_drop() {
+        let dir = UniqueTestDir::new("raii-drop").unwrap();
+        let path = dir.path().to_path_buf();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unique_test_dir_path_borrow_does_not_consume_guard() {
+        let dir = UniqueTestDir::new("raii-borrow").unwrap();
+        let borrowed = dir.path();
+        assert!(borrowed.is_dir());
+        assert!(dir.path().exists());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_dirs::UniqueTestDir;
+    use zeron_proto::{AuthState, WorkspaceScope};
+
+    #[test]
     fn rejects_invalid_locators() {
-        let dir = scratch_parent();
-        assert!(BrowserProfileStorage::from_locator(&dir, "short").is_err());
-        assert!(BrowserProfileStorage::from_locator(&dir, "gggggggggggggggg").is_err());
-        assert!(BrowserProfileStorage::from_locator(&dir, "../../../etc/passwd").is_err());
+        let dir = UniqueTestDir::new("reject-locators").unwrap();
+        let root = dir.path();
+        assert!(BrowserProfileStorage::from_locator(root, "short").is_err());
+        assert!(BrowserProfileStorage::from_locator(root, "gggggggggggggggg").is_err());
+        assert!(BrowserProfileStorage::from_locator(root, "../../../etc/passwd").is_err());
     }
 
     #[test]
     fn storage_paths_are_opaque_and_locator_scoped() {
-        let dir = scratch_parent().join("zeron-browser-profile-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let a = BrowserProfileStorage::from_locator(&dir, "abc123def4567890").unwrap();
-        let b = BrowserProfileStorage::from_locator(&dir, "fedcba0987654321").unwrap();
-        assert!(a.storage_root().starts_with(&dir));
+        let dir = UniqueTestDir::new("opaque-paths").unwrap();
+        let root = dir.path();
+        let a = BrowserProfileStorage::from_locator(root, "abc123def4567890").unwrap();
+        let b = BrowserProfileStorage::from_locator(root, "fedcba0987654321").unwrap();
+        assert!(a.storage_root().starts_with(root));
         assert!(a.storage_root().ends_with("abc123def4567890"));
         assert_ne!(a.storage_root(), b.storage_root());
         assert!(!a.storage_root().to_string_lossy().contains("user:"));
@@ -145,8 +204,8 @@ mod tests {
 
     #[test]
     fn distinct_workspace_locators_get_distinct_store_ids() {
-        let dir = scratch_parent().join("zeron-browser-profile-test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = UniqueTestDir::new("distinct-stores").unwrap();
+        let root = dir.path();
         let scope = Some(WorkspaceScope::Synced);
         let auth_a = AuthState::SignedIn {
             user: zeron_proto::UserProfile {
@@ -166,10 +225,10 @@ mod tests {
         };
         let loc_a = crate::links::workspace_locator(scope, Some(&auth_a), Some("device")).unwrap();
         let loc_b = crate::links::workspace_locator(scope, Some(&auth_b), Some("device")).unwrap();
-        let store_a = BrowserProfileStorage::from_locator(&dir, &loc_a)
+        let store_a = BrowserProfileStorage::from_locator(root, &loc_a)
             .unwrap()
             .store_uuid();
-        let store_b = BrowserProfileStorage::from_locator(&dir, &loc_b)
+        let store_b = BrowserProfileStorage::from_locator(root, &loc_b)
             .unwrap()
             .store_uuid();
         assert_ne!(loc_a, loc_b);
@@ -178,9 +237,8 @@ mod tests {
 
     #[test]
     fn store_uuid_is_stable_for_one_locator() {
-        let dir = scratch_parent().join("zeron-browser-profile-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let storage = BrowserProfileStorage::from_locator(&dir, "0123456789abcdef").unwrap();
+        let dir = UniqueTestDir::new("stable-uuid").unwrap();
+        let storage = BrowserProfileStorage::from_locator(dir.path(), "0123456789abcdef").unwrap();
         assert_eq!(storage.store_uuid(), storage.store_uuid());
     }
 }

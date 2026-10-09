@@ -16816,6 +16816,17 @@ impl Shell {
         self.browser_clear_error = None;
         cx.notify();
     }
+    pub fn fixture_browser_persistence_diag(&self) -> String {
+        if let Some(storage) = self.browser_context.profile_mode().storage() {
+            format!(
+                "mode=persistent locator={} store_uuid={}",
+                storage.locator,
+                storage.store_uuid()
+            )
+        } else {
+            "mode=deferred".to_string()
+        }
+    }
     pub fn fixture_browser_clear_busy(&self) -> bool {
         self.browser_clear_task.is_some() || self.browser_context.is_clearing()
     }
