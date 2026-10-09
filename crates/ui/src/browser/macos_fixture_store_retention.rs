@@ -8,12 +8,10 @@
 use objc2::rc::Retained;
 use objc2_web_kit::WKWebsiteDataStore;
 
-pub fn retain_website_data_store_enabled() -> bool {
-    matches!(
-        std::env::var("ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE").as_deref(),
-        Ok("1")
-    )
-}
+#[path = "fixture_store_retention_env.rs"]
+mod fixture_store_retention_env;
+
+pub use fixture_store_retention_env::retain_website_data_store_enabled;
 
 /// Retain the same store object WebKit already opened for this profile (no recreation).
 ///

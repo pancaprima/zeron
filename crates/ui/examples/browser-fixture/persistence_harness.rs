@@ -500,6 +500,31 @@ pub async fn run_phase(
                 "PASS: clear-confirm removed website data for identity A only; identity B unchanged.\n",
             )
         }
+        // Read-only: a fresh process after `clear-confirm` must see the clear and B's data on disk.
+        "clear-verify" => {
+            anyhow::ensure!(
+                std::env::var_os("ZERON_BROWSER_FIXTURE_INJECT_CLEAR_ERROR").is_none(),
+                "clear-verify phase must run without ZERON_BROWSER_FIXTURE_INJECT_CLEAR_ERROR"
+            );
+            let marker = require_relaunch_marker(root)?;
+            let origin = ensure_loopback_origin(&site, &marker)?;
+            let (_id_a, browser_a) = open_browser(window, cx).await?;
+            expect_storage(window, &browser_a, origin, false, cx).await?;
+            window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_a, w, cx))?;
+            pause(cx, 200).await;
+            window.update(cx, |shell, _, cx| {
+                shell.fixture_set_local_device_id(DEVICE_B, cx)
+            })?;
+            pause(cx, 300).await;
+            let (_id_b, browser_b) = open_browser(window, cx).await?;
+            expect_storage(window, &browser_b, origin, true, cx).await?;
+            window.update(cx, |shell, w, cx| shell.fixture_close_browser(_id_b, w, cx))?;
+            pause(cx, 200).await;
+            write_success(
+                output,
+                "PASS: clear-verify read identity A cleared and identity B intact after process restart.\n",
+            )
+        }
         "clear-failure" => {
             anyhow::ensure!(
                 std::env::var_os("ZERON_BROWSER_FIXTURE_INJECT_CLEAR_ERROR").is_some(),

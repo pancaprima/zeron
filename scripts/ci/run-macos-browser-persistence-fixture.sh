@@ -12,35 +12,8 @@ mkdir -p "$PERSIST_ROOT"
 # shellcheck source=browser-persistence-fixture-harness-lib.sh
 source "$ROOT/scripts/ci/browser-persistence-fixture-harness-lib.sh"
 
-VERIFY_PENDING=0
-on_exit() {
-  local rc=$?
-  trap - EXIT
-  if [ "$VERIFY_PENDING" = 1 ]; then
-    ( set +e; dump_store_evidence after-relaunch-verify-failure "$PERSIST_ROOT" ) || true
-    ( set +e; capture_webkit_log after-relaunch-verify-failure "$WRITE_SINCE" ) || true
-  fi
-  exit "$rc"
-}
-
 ( set +e; record_runner_webkit ) || true
 ( set +e; run_causal_lifecycle_contrast ) || true
-unset ZERON_BROWSER_FIXTURE_RETAIN_WEBSITE_DATA_STORE || true
-unset ZERON_BROWSER_PERSISTENCE_DEVICE_A || true
-export ZERON_BROWSER_PERSISTENCE_ROOT="$PERSIST_ROOT"
-WRITE_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
-echo "acceptance-lifecycle boundary phase=release-harness fixture_lifecycle=production-store-registry retain_env=unset root=$PERSIST_ROOT"
-run_phase relaunch-write
-test -f "$PERSIST_ROOT/relaunch-marker.json"
-( set +e; dump_store_evidence after-relaunch-write-exit "$PERSIST_ROOT" ) || true
-VERIFY_PENDING=1
-trap on_exit EXIT
-run_phase relaunch-verify
-VERIFY_PENDING=0
-( set +e; capture_webkit_log after-relaunch-verify-success "$WRITE_SINCE" ) || true
-run_phase isolation
-run_phase clear-cancel
-run_phase clear-confirm
-run_phase clear-failure
+run_release_acceptance
 
 echo "browser persistence acceptance harness finished (root=$PERSIST_ROOT)"

@@ -11,6 +11,10 @@ on:
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/ci/run-macos-fixture.sh'
       - 'scripts/ci/run-macos-browser-persistence-fixture.sh'
+      - 'scripts/ci/browser-persistence-fixture-harness-lib.sh'
+      - 'scripts/ci/test-browser-persistence-fixture-harness.sh'
+      - 'scripts/ci/browser_store_registry_leaf.rs'
+      - 'scripts/ci/browser_persistence_fixture_retain_env.rs'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/macos.yml'
@@ -25,6 +29,10 @@ on:
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/ci/run-macos-fixture.sh'
       - 'scripts/ci/run-macos-browser-persistence-fixture.sh'
+      - 'scripts/ci/browser-persistence-fixture-harness-lib.sh'
+      - 'scripts/ci/test-browser-persistence-fixture-harness.sh'
+      - 'scripts/ci/browser_store_registry_leaf.rs'
+      - 'scripts/ci/browser_persistence_fixture_retain_env.rs'
       - 'dist/macos/Info.plist'
       - 'apps/ios/**'
       - '.github/workflows/macos.yml'
@@ -91,6 +99,9 @@ jobs:
         run: |
           rustup update stable --no-self-update
           rustup show active-toolchain || rustup toolchain install
+      # rustc-only (no workspace build): fails fast before the cold build below.
+      - name: Browser persistence harness, store registry core and retention env gate
+        run: bash scripts/ci/test-browser-persistence-fixture-harness.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
