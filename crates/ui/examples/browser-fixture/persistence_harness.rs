@@ -78,7 +78,7 @@ async fn log_native_cookie_diag(
     if std::env::consts::OS != "macos" {
         return Ok(());
     }
-    let task = browser.update(cx, |b, cx| b.fixture_native_cookie_diag(COOKIE_NAME, cx))?;
+    let task = browser.update(cx, |b, cx| b.fixture_native_cookie_diag(COOKIE_NAME, cx));
     let deadline = cx.background_executor().timer(Duration::from_secs(15));
     let line = match futures::future::select(Box::pin(task), Box::pin(deadline)).await {
         futures::future::Either::Left((result, _)) => {

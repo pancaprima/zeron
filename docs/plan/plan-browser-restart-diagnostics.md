@@ -62,6 +62,14 @@ If CI shows `write-storage:after-readback-native present=1` and `restart-verify:
 - [x] Isolated unit probe (no `cargo`, no workspace deps): `rustc --test crates/ui/src/browser/persistence_probe.rs` — **5/5 tests pass**.
 - [ ] Existing lightweight script tests if applicable.
 
+### macOS CI compile evidence (2026-10-09)
+
+Source: `zeron-native-cookie-diag-ci-failed.log` — `browser-fixture` example build.
+
+| Error | Location | Minimal fix |
+|-------|----------|-------------|
+| E0277 | `persistence_harness.rs:81` | `Entity::update` returns `Task<Result<String,String>>`; drop trailing `?` on task creation (match `load_origin` nested `browser.update`); keep `futures::select` + GPUI timer bound before awaiting task. |
+
 ### Windows CI compile evidence (pre-fix)
 
 Source: `/root/.hermes/profiles/girlfriend/cache/scratch/zeron-browser-windows-failed.log` (PR #2 merge `aec9f02`).
