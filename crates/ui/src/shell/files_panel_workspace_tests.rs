@@ -140,12 +140,31 @@ fn files_panel_workspace_navigation_and_external_updates() {
             .rename_chat(id, &format!("Explore files · {id}"))
             .unwrap();
     }
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let _ipc = runtime
-        .block_on(zeron_engine::serve_ipc(port, core.rpc_service()))
-        .unwrap();
+    const IPC_BIND_ATTEMPTS: usize = 8;
+    let mut port = 0_u16;
+    let mut ipc_server = None;
+    let mut last_addr_in_use = None;
+    for _ in 0..IPC_BIND_ATTEMPTS {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        port = listener.local_addr().unwrap().port();
+        drop(listener);
+        match runtime.block_on(zeron_engine::serve_ipc(port, core.rpc_service())) {
+            Ok(ipc) => {
+                ipc_server = Some(ipc);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                last_addr_in_use = Some(err);
+            }
+            Err(err) => panic!("serve_ipc on port {port} failed: {err}"),
+        }
+    }
+    let _ipc = ipc_server.unwrap_or_else(|| {
+        panic!(
+            "failed to bind IPC after {IPC_BIND_ATTEMPTS} attempts (AddrInUse): {}",
+            last_addr_in_use.unwrap()
+        );
+    });
     let output = std::env::var_os("ZERON_FILES_CAPTURES").map(PathBuf::from);
     let application = if output.is_some() {
         gpui_platform::application()
