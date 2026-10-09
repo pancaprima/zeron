@@ -118,7 +118,7 @@ impl BrowserData {
 
     pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
         let data = self.clone();
-        cx.spawn(async move {
+        cx.spawn(async move |_cx| {
             let (tx, rx) = tokio::sync::oneshot::channel();
             data.with_environment(move |environment| match environment {
                 Ok(environment) => match data.browsing_profile_for_clear(&environment) {

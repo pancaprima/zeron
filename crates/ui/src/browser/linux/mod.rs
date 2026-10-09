@@ -97,7 +97,7 @@ impl BrowserData {
 
     pub fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
         let data = self.clone();
-        cx.spawn(async move {
+        cx.spawn(async move |_cx| {
             let worker = data.worker()?;
             let (tx, rx) = tokio::sync::oneshot::channel();
             *worker.clear_waiter.lock().unwrap() = Some(tx);

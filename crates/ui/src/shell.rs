@@ -3703,8 +3703,9 @@ impl Shell {
             .collect::<Vec<_>>();
         let context = self.browser_context.clone();
         context.set_clearing(true);
+        let clear_task = context.clear_website_data(cx);
         self.browser_clear_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = context.clear_website_data(cx).await;
+            let result = clear_task.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 context.set_clearing(false);
                 this.browser_clear_task = None;
@@ -3720,7 +3721,7 @@ impl Shell {
                 if result.is_ok() {
                     for (id, _) in reloads {
                         if let Some(browser) = this.browsers.get(&id) {
-                            browser.update(cx, |browser, window, cx| {
+                            browser.update(cx, |browser, cx| {
                                 browser.reload_after_data_clear(window, cx);
                             });
                         }

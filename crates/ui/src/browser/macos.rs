@@ -47,7 +47,7 @@ impl BrowserData {
 
     pub(super) fn clear_website_data(&self, cx: &gpui::App) -> gpui::Task<Result<(), String>> {
         let data = self.clone();
-        cx.spawn(async move {
+        cx.spawn(async move |_cx| {
             let mtm = MainThreadMarker::new().ok_or_else(|| {
                 "Browser data clear must run on the main thread. Try again.".to_string()
             })?;
