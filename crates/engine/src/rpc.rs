@@ -1440,6 +1440,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
+            | methods::SEARCH_WORKSPACE_CONTENT
             | methods::READ_WORKSPACE_IMAGE
             | methods::READ_WORKSPACE_FILE
             | methods::DELETE_WORKSPACE_ENTRY
@@ -3086,6 +3087,17 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&matches)
             }
+            methods::SEARCH_WORKSPACE_CONTENT => {
+                let request: zeron_proto::SearchWorkspaceContentRequest = parse_params(params)?;
+                let response = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search_content(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace content search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&response)
+            }
             methods::READ_WORKSPACE_IMAGE => {
                 let request: zeron_proto::ReadWorkspaceImageRequest = parse_params(params)?;
                 let chunk = tokio::time::timeout(
@@ -4022,6 +4034,7 @@ mod tests {
         assert!(forwardable(methods::DISCARD_WORKING_TREE));
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
+        assert!(forwardable(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
         assert!(forwardable(methods::READ_WORKSPACE_IMAGE));
         assert!(forwardable(methods::DELETE_WORKSPACE_ENTRY));
@@ -4031,6 +4044,7 @@ mod tests {
         assert!(forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));
         assert!(!is_stream_method(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_FILES));
+        assert!(!is_stream_method(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));

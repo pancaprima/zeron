@@ -7,13 +7,14 @@ use gpui::{
     AnyElement, Context, ListSizingBehavior, SharedString, Task, Window, div, list, prelude::*, px,
 };
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, SearchWorkspaceFilesRequest, WorkspaceEntryKind,
+    ListWorkspaceDirectoryRequest, SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest,
+    WorkspaceContentMatchMode, WorkspaceContentSearchCompletion,
+    WorkspaceContentSearchIncompleteReason, WorkspaceContentSearchMatch, WorkspaceEntryKind,
     WorkspaceFileSearchMatch,
 };
-
 use super::{
-    FilesSurface, WorkspacePathDrag, client::WorkspaceFilesClient, model::parent_path,
-    workspace_path_drag_ghost,
+    FilesSurface, OpenFileColumnUnit, OpenFileLocation, WorkspacePathDrag, client::FilesClientError,
+    client::WorkspaceFilesClient, model::parent_path, workspace_path_drag_ghost,
 };
 use crate::{
     file_icons::{self, FileIconIdentity},
@@ -22,7 +23,27 @@ use crate::{
 };
 
 pub const SEARCH_ROW_HEIGHT: f32 = 27.0;
+pub const SEARCH_CONTENT_ROW_HEIGHT: f32 = 44.0;
 const SEARCH_RESULT_LIMIT: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ExplorerSearchKind {
+    #[default]
+    Files,
+    Contents,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContentMatchMode {
+    Literal,
+    Fuzzy,
+}
+
+impl Default for ContentMatchMode {
+    fn default() -> Self {
+        Self::Literal
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SearchTreeNode {
@@ -263,7 +284,12 @@ impl RevealIntent {
 #[derive(Default)]
 pub(super) struct FileSearchState {
     pub query: String,
+    pub kind: ExplorerSearchKind,
+    pub content_mode: ContentMatchMode,
     pub results: Vec<WorkspaceFileSearchMatch>,
+    pub content_results: Vec<WorkspaceContentSearchMatch>,
+    pub content_completion: Option<WorkspaceContentSearchCompletion>,
+    pub content_incomplete_reason: Option<WorkspaceContentSearchIncompleteReason>,
     pub loading: bool,
     pub error: Option<SharedString>,
     pub generation: u64,
@@ -273,6 +299,7 @@ pub(super) struct FileSearchState {
     reveal_generation: u64,
     reveal_intent: RevealIntent,
     reveal_scroll_pending: bool,
+    pending_open_location: Option<OpenFileLocation>,
     tree: SearchTreeModel,
 }
 
@@ -282,14 +309,52 @@ impl FileSearchState {
     }
 
     pub(super) fn visible_len(&self) -> usize {
-        self.tree.rows().len()
+        match self.kind {
+            ExplorerSearchKind::Files => self.tree.rows().len(),
+            ExplorerSearchKind::Contents => self.content_results.len(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.active = 0;
+        self.error = None;
+        self.task = None;
+        self.results.clear();
+        self.content_results.clear();
+        self.content_completion = None;
+        self.content_incomplete_reason = None;
+        self.pending_open_location = None;
+        self.tree.clear();
+    }
+}
+
+enum SearchResponse {
+    Files(Vec<WorkspaceFileSearchMatch>),
+    Contents(zeron_proto::SearchWorkspaceContentResponse),
+}
+
+fn content_search_error_message(error: FilesClientError) -> SharedString {
+    match &error {
+        FilesClientError::Request(message)
+            if message.contains("unknown method")
+                || message.contains("UnknownMethod")
+                || message.contains("SearchWorkspaceContent") =>
+        {
+            "Content search is not supported on this workspace host. Update the owning device to search file contents.".into()
+        }
+        _ => error.to_string().into(),
     }
 }
 
 impl FilesSurface {
     pub(super) fn on_search_edited(&mut self, cx: &mut Context<Self>) {
+        self.on_search_edited_internal(false, cx);
+    }
+
+    fn on_search_edited_internal(&mut self, force: bool, cx: &mut Context<Self>) {
         let query = self.search.read(cx).text().trim().to_string();
-        if self.search_state.query == query {
+        if !force && self.search_state.query == query {
             return;
         }
         if self.search_state.reveal_intent.clears_search() {
@@ -303,6 +368,9 @@ impl FilesSurface {
         if query.is_empty() {
             self.search_state.loading = false;
             self.search_state.results.clear();
+            self.search_state.content_results.clear();
+            self.search_state.content_completion = None;
+            self.search_state.content_incomplete_reason = None;
             self.search_state.tree.clear();
             self.search_list.reset(0);
             if self.search_state.reveal_scroll_pending {
@@ -332,44 +400,88 @@ impl FilesSurface {
         };
         self.search_state.loading = true;
         let generation = self.search_state.generation;
-        let request = SearchWorkspaceFilesRequest {
-            target: context.target.clone(),
-            query: query.clone(),
-            include_ignored: self.tree.include_ignored(),
-            limit: Some(SEARCH_RESULT_LIMIT as u16),
-        };
+        let include_ignored = self.tree.include_ignored();
+        let kind = self.search_state.kind;
+        let content_mode = self.search_state.content_mode;
         let client = WorkspaceFilesClient::new(engine, context.clone());
         self.search_state.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(200))
                 .await;
-            let result = client.search(request).await;
+            let result = match kind {
+                ExplorerSearchKind::Files => client
+                    .search(SearchWorkspaceFilesRequest {
+                        target: context.target.clone(),
+                        query: query.clone(),
+                        include_ignored,
+                        limit: Some(SEARCH_RESULT_LIMIT as u16),
+                    })
+                    .await
+                    .map(SearchResponse::Files),
+                ExplorerSearchKind::Contents => client
+                    .search_content(SearchWorkspaceContentRequest {
+                        target: context.target.clone(),
+                        query: query.clone(),
+                        match_mode: match content_mode {
+                            ContentMatchMode::Literal => WorkspaceContentMatchMode::Literal,
+                            ContentMatchMode::Fuzzy => WorkspaceContentMatchMode::Fuzzy,
+                        },
+                        include_ignored,
+                        limit: Some(SEARCH_RESULT_LIMIT as u16),
+                    })
+                    .await
+                    .map(SearchResponse::Contents),
+            };
             let _ = this.update(cx, |surface, cx| {
                 if !surface.search_state.accepts(generation, &query)
                     || surface.request_context.as_ref() != Some(&context)
+                    || surface.search_state.kind != kind
                 {
                     return;
                 }
                 surface.search_state.loading = false;
                 match result {
-                    Ok(results) => {
+                    Ok(SearchResponse::Files(results)) => {
                         surface.search_state.error = None;
                         surface.search_state.results = results;
+                        surface.search_state.content_results.clear();
                         surface
                             .search_state
                             .tree
                             .rebuild(&surface.search_state.results);
                         surface.search_state.active = 0;
                     }
+                    Ok(SearchResponse::Contents(response)) => {
+                        surface.search_state.error = None;
+                        surface.search_state.results.clear();
+                        surface.search_state.tree.clear();
+                        surface.search_state.content_results = response.matches;
+                        surface.search_state.content_completion = Some(response.completion);
+                        surface.search_state.content_incomplete_reason =
+                            response.incomplete_reason;
+                        surface.search_state.active = 0;
+                    }
                     Err(error) => {
-                        surface.search_state.error = Some(error.to_string().into());
+                        surface.search_state.error = Some(match kind {
+                            ExplorerSearchKind::Contents => content_search_error_message(error),
+                            ExplorerSearchKind::Files => error.to_string().into(),
+                        });
                     }
                 }
-                surface.search_list.reset_with_uniform_height(
-                    surface.search_state.tree.rows().len(),
-                    px(SEARCH_ROW_HEIGHT),
-                );
-                let has_results = !surface.search_state.tree.rows().is_empty();
+                let (count, row_height) = match surface.search_state.kind {
+                    ExplorerSearchKind::Files => (
+                        surface.search_state.tree.rows().len(),
+                        SEARCH_ROW_HEIGHT,
+                    ),
+                    ExplorerSearchKind::Contents => (
+                        surface.search_state.content_results.len(),
+                        SEARCH_CONTENT_ROW_HEIGHT,
+                    ),
+                };
+                surface
+                    .search_list
+                    .reset_with_uniform_height(count, px(row_height));
+                let has_results = count > 0;
                 surface.search.update(cx, |search, cx| {
                     search.set_mention_controls(true, has_results, cx)
                 });
@@ -379,11 +491,62 @@ impl FilesSurface {
         cx.notify();
     }
 
+    pub(super) fn set_explorer_search_kind(
+        &mut self,
+        kind: ExplorerSearchKind,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_state.kind == kind {
+            return;
+        }
+        self.search_state.kind = kind;
+        if self.search_state.query.is_empty() {
+            self.search_state.invalidate();
+            cx.notify();
+            return;
+        }
+        self.search_state.invalidate();
+        self.search_state.query = self.search.read(cx).text().trim().to_string();
+        self.on_search_edited_internal(true, cx);
+    }
+
+    pub(super) fn set_content_match_mode(
+        &mut self,
+        mode: ContentMatchMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search_state.content_mode == mode {
+            return;
+        }
+        self.search_state.content_mode = mode;
+        if self.search_state.kind != ExplorerSearchKind::Contents
+            || self.search_state.query.is_empty()
+        {
+            cx.notify();
+            return;
+        }
+        self.search_state.invalidate();
+        self.search_state.query = self.search.read(cx).text().trim().to_string();
+        self.on_search_edited_internal(true, cx);
+    }
+
     pub(super) fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search.update(cx, |search, cx| search.set_text("", cx));
     }
 
     pub(super) fn activate_search_result(&mut self, cx: &mut Context<Self>) {
+        if self.search_state.kind == ExplorerSearchKind::Contents {
+            let Some(result) = self
+                .search_state
+                .content_results
+                .get(self.search_state.active)
+                .cloned()
+            else {
+                return;
+            };
+            self.activate_content_search_result(result, cx);
+            return;
+        }
         let Some(row) = self
             .search_state
             .tree
@@ -418,7 +581,23 @@ impl FilesSurface {
 
     pub(super) fn reset_search_results(&mut self) {
         self.search_state.tree.clear();
+        self.search_state.content_results.clear();
         self.search_list.reset(0);
+    }
+
+    fn activate_content_search_result(
+        &mut self,
+        result: WorkspaceContentSearchMatch,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_state.pending_open_location = Some(OpenFileLocation {
+            line: result.line,
+            match_start_column: result.line_match_start,
+            match_end_column: result.line_match_end,
+            match_text: result.match_text,
+            column_unit: OpenFileColumnUnit::Utf32ScalarOffset,
+        });
+        self.reveal_path(result.path, RevealIntent::OpenFile, cx);
     }
 
     pub(super) fn cancel_reveal(&mut self) {
@@ -535,7 +714,8 @@ impl FilesSurface {
         }
         if intent.opens_file() {
             self.selected_editor_path = Some(path.clone());
-            self.open_tree_file(path, cx);
+            let location = self.search_state.pending_open_location.take();
+            self.open_tree_file(path, location, cx);
         }
         if self.search_state.query.is_empty() {
             self.reveal_tree_selection();
@@ -549,6 +729,9 @@ impl FilesSurface {
         let theme = Theme::of(cx).clone();
         if let Some(error) = self.search_state.error.clone() {
             return centered_search_message(error, theme.danger.opacity(0.82));
+        }
+        if self.search_state.kind == ExplorerSearchKind::Contents {
+            return self.render_content_search_results(&theme, cx);
         }
         if self.search_state.results.is_empty() {
             let label = if self.search_state.loading {
@@ -569,18 +752,10 @@ impl FilesSurface {
             .when(
                 self.search_state.results.len() >= SEARCH_RESULT_LIMIT,
                 |element| {
-                    element.child(
-                        div()
-                            .h(px(24.0))
-                            .flex_none()
-                            .px(px(10.0))
-                            .flex()
-                            .items_center()
-                            .font_family(theme.font_sans.clone())
-                            .text_size(px(10.0))
-                            .text_color(theme.text_faint)
-                            .child("Showing the first 200 matches"),
-                    )
+                    element.child(search_status_banner(
+                        "Showing the first 200 matches",
+                        &theme,
+                    ))
                 },
             )
             .child(
@@ -591,6 +766,127 @@ impl FilesSurface {
                 .flex_1()
                 .min_h_0()
                 .with_sizing_behavior(ListSizingBehavior::Auto),
+            )
+            .into_any_element()
+    }
+
+    fn render_content_search_results(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.search_state.content_results.is_empty() {
+            let label = if self.search_state.loading {
+                "Searching…"
+            } else {
+                "No content matches found."
+            };
+            return centered_search_message(label.into(), theme.text_faint);
+        }
+        let status = content_search_status_message(
+            self.search_state.content_completion,
+            self.search_state.content_incomplete_reason,
+        );
+        div()
+            .id("files-content-search-results")
+            .role(gpui::Role::Listbox)
+            .aria_label("Workspace content search results")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when_some(status, |element, message| {
+                element.child(search_status_banner(message, theme))
+            })
+            .child(
+                list(
+                    self.search_list.clone(),
+                    cx.processor(Self::render_content_search_row),
+                )
+                .flex_1()
+                .min_h_0()
+                .with_sizing_behavior(ListSizingBehavior::Auto),
+            )
+            .into_any_element()
+    }
+
+    fn render_content_search_row(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(result) = self.search_state.content_results.get(index).cloned() else {
+            return gpui::Empty.into_any_element();
+        };
+        let theme = Theme::of(cx).clone();
+        let selected = self.search_state.active == index;
+        let file_name = result
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(result.path.as_str());
+        let header = format!("{}:{}", result.path, result.line);
+        div()
+            .id(("files-content-search-result", index))
+            .role(gpui::Role::Option)
+            .aria_label(header.clone())
+            .aria_selected(selected)
+            .h(px(SEARCH_CONTENT_ROW_HEIGHT))
+            .w_full()
+            .flex_none()
+            .px(px(8.0))
+            .py(px(4.0))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(2.0))
+            .cursor_pointer()
+            .when(selected, |element| element.bg(crate::theme::wash(0.1)))
+            .when(!selected, |element| {
+                element.hover(|style| style.bg(crate::theme::wash(0.055)))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.search_state.active = index;
+                this.activate_search_result(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .overflow_hidden()
+                    .child(
+                        file_icons::icon(
+                            FileIconIdentity::file(file_name),
+                            theme.appearance,
+                        )
+                        .size(px(14.0))
+                        .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_size(px(11.0))
+                            .text_color(theme.text)
+                            .child(file_name),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .child(format!(":{}", result.line)),
+                    ),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted)
+                    .child(render_preview_highlights(&result.preview, &result.preview_highlights, theme)),
             )
             .into_any_element()
     }
@@ -693,6 +989,88 @@ impl FilesSurface {
     }
 }
 
+fn search_status_banner(message: impl Into<SharedString>, theme: &Theme) -> AnyElement {
+    div()
+        .h(px(24.0))
+        .flex_none()
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .font_family(theme.font_sans.clone())
+        .text_size(px(10.0))
+        .text_color(theme.text_faint)
+        .child(message.into())
+        .into_any_element()
+}
+
+fn content_search_status_message(
+    completion: Option<WorkspaceContentSearchCompletion>,
+    incomplete_reason: Option<WorkspaceContentSearchIncompleteReason>,
+) -> Option<&'static str> {
+    match completion {
+        Some(WorkspaceContentSearchCompletion::ResultLimitReached) => {
+            Some("Showing the first 200 matches")
+        }
+        Some(WorkspaceContentSearchCompletion::ScanIncomplete) => {
+            match incomplete_reason {
+                Some(WorkspaceContentSearchIncompleteReason::ScanBudgetExceeded) => {
+                    Some("Scan stopped early; results may be incomplete")
+                }
+                Some(WorkspaceContentSearchIncompleteReason::Cancelled) => {
+                    Some("Scan was cancelled")
+                }
+                None => Some("Scan incomplete"),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn render_preview_highlights(
+    preview: &str,
+    highlights: &[zeron_proto::WorkspaceContentHighlightRange],
+    theme: &Theme,
+) -> AnyElement {
+    if highlights.is_empty() {
+        return div().truncate().child(preview).into_any_element();
+    }
+    let mut elements = Vec::new();
+    let mut cursor = 0usize;
+    for range in highlights {
+        let start = range.start as usize;
+        let end = range.end as usize;
+        if start < cursor || end > preview.len() || !preview.is_char_boundary(start) || !preview.is_char_boundary(end) {
+            continue;
+        }
+        if start > cursor {
+            elements.push(
+                div()
+                    .inline()
+                    .child(preview[cursor..start].to_string())
+                    .into_any_element(),
+            );
+        }
+        elements.push(
+            div()
+                .inline()
+                .bg(crate::theme::wash(0.18))
+                .text_color(theme.text)
+                .child(preview[start..end].to_string())
+                .into_any_element(),
+        );
+        cursor = end;
+    }
+    if cursor < preview.len() {
+        elements.push(
+            div()
+                .inline()
+                .child(preview[cursor..].to_string())
+                .into_any_element(),
+        );
+    }
+    div().truncate().flex().children(elements).into_any_element()
+}
+
 fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyElement {
     div()
         .flex_1()
@@ -711,6 +1089,27 @@ fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyEleme
 mod tests {
     use super::*;
 
+    #[test]
+    fn content_open_location_uses_scalar_columns() {
+        let location = OpenFileLocation {
+            line: 4,
+            match_start_column: 2,
+            match_end_column: 6,
+            match_text: "find".into(),
+            column_unit: OpenFileColumnUnit::Utf32ScalarOffset,
+        };
+        assert_eq!(location.column_unit, OpenFileColumnUnit::Utf32ScalarOffset);
+    }
+
+    #[test]
+    fn content_search_unknown_method_is_explicit() {
+        let message = content_search_error_message(FilesClientError::Request(
+            "unknown method: SearchWorkspaceContent".into(),
+        ));
+        assert!(message.contains("not supported"));
+        assert!(!message.contains("filename"));
+    }
+
     fn search_match(path: &str, kind: WorkspaceEntryKind, score: i64) -> WorkspaceFileSearchMatch {
         WorkspaceFileSearchMatch {
             path: path.to_string(),
@@ -718,6 +1117,20 @@ mod tests {
             kind,
             score,
         }
+    }
+
+    #[test]
+    fn search_invalidate_clears_pending_open_location() {
+        let mut state = FileSearchState::default();
+        state.pending_open_location = Some(OpenFileLocation {
+            line: 1,
+            match_start_column: 0,
+            match_end_column: 1,
+            match_text: "x".into(),
+            column_unit: OpenFileColumnUnit::Utf32ScalarOffset,
+        });
+        state.invalidate();
+        assert!(state.pending_open_location.is_none());
     }
 
     #[test]
@@ -835,8 +1248,8 @@ mod reveal_tests {
         let events = opened.clone();
         let _sub = cx.update(|cx| {
             cx.subscribe(&surface, move |_, event, _| {
-                if let FilesEvent::OpenFile(path) = event {
-                    events.borrow_mut().push(path.clone());
+                if let FilesEvent::OpenFile(request) = event {
+                    events.borrow_mut().push(request.path.clone());
                 }
             })
         });
@@ -872,8 +1285,8 @@ mod reveal_tests {
         let events = opened.clone();
         let _sub = cx.update(|cx| {
             cx.subscribe(&surface, move |_, event, _| {
-                if let FilesEvent::OpenFile(path) = event {
-                    events.borrow_mut().push(path.clone());
+                if let FilesEvent::OpenFile(request) = event {
+                    events.borrow_mut().push(request.path.clone());
                 }
             })
         });

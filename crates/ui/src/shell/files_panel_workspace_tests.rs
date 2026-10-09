@@ -298,7 +298,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                     .unwrap();
                 window
                     .update(cx, |shell, window, cx| {
-                        shell.add_file_surface("src/nested/main.rs".into(), window, cx)
+                        shell.add_file_surface("src/nested/main.rs".into(), None, window, cx)
                     })
                     .unwrap();
                 wait_for(window, cx, "nested file and selection", |shell, cx| {
@@ -327,7 +327,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "02-editor-files").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        shell.add_file_surface("README.md".into(), window, cx);
+                        shell.add_file_surface("README.md".into(), None, window, cx);
                     })
                     .unwrap();
                 frame(window, cx, output.as_deref(), "02b-two-file-tabs").await;
@@ -352,7 +352,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 window
                     .update(cx, |shell, window, cx| {
                         shell.toggle_files_panel(window, cx);
-                        shell.add_file_surface("src/nested/main.rs".into(), window, cx);
+                        shell.add_file_surface("src/nested/main.rs".into(), None, window, cx);
                     })
                     .unwrap();
                 window
@@ -401,7 +401,7 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 frame(window, cx, output.as_deref(), "05-browser-files").await;
                 window
                     .update(cx, |shell, window, cx| {
-                        shell.add_file_surface("src/nested/main.rs".into(), window, cx);
+                        shell.add_file_surface("src/nested/main.rs".into(), None, window, cx);
                         shell.toggle_files_panel(window, cx);
                     })
                     .unwrap();
@@ -433,7 +433,10 @@ fn files_panel_workspace_navigation_and_external_updates() {
                 })
                 .await;
                 first_explorer.update(cx, |_, cx| {
-                    cx.emit(FilesEvent::OpenFile("README.md".into()))
+                    cx.emit(FilesEvent::OpenFile(crate::files::OpenFileRequest {
+                        path: "README.md".into(),
+                        location: None,
+                    }))
                 });
                 frame(window, cx, None, "inactive-event").await;
                 window

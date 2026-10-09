@@ -142,7 +142,7 @@ fn setup_with_shell(
     cx.update(|window, cx| window.draw(cx).clear());
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
-            shell.add_file_surface("src/tab.rs".into(), window, cx);
+            shell.add_file_surface("src/tab.rs".into(), None, window, cx);
             let explorer = cx.new(|cx| {
                 crate::files::FilesSurface::new_explorer(
                     shell.state.clone(),

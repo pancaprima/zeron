@@ -555,6 +555,81 @@ pub struct WorkspaceFileSearchMatch {
     pub score: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceContentMatchMode {
+    Literal,
+    Fuzzy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceContentSearchCompletion {
+    Complete,
+    ResultLimitReached,
+    ScanIncomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceContentSearchIncompleteReason {
+    ScanBudgetExceeded,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceContentRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub query: String,
+    pub match_mode: WorkspaceContentMatchMode,
+    #[serde(default)]
+    pub include_ignored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceContentHighlightRange {
+    /// UTF-8 byte offset within `preview`, on a character boundary.
+    pub start: u32,
+    /// UTF-8 byte offset within `preview`, exclusive, on a character boundary.
+    pub end: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceContentSearchMatch {
+    pub path: String,
+    /// One-based line number in the file at scan time.
+    pub line: u32,
+    pub preview: String,
+    pub preview_highlights: Vec<WorkspaceContentHighlightRange>,
+    /// Character offset within the full source line (0-based, exclusive end).
+    pub line_match_start: u32,
+    pub line_match_end: u32,
+    /// Matched substring from the source line, for stale-result checks after open.
+    pub match_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceContentResponse {
+    pub matches: Vec<WorkspaceContentSearchMatch>,
+    pub files_scanned: u32,
+    pub skipped_binary: u32,
+    pub skipped_too_large: u32,
+    pub skipped_unsupported: u32,
+    pub skipped_errors: u32,
+    pub completion: WorkspaceContentSearchCompletion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<WorkspaceContentSearchIncompleteReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadWorkspaceFileRequest {
@@ -1374,6 +1449,62 @@ mod tests {
             .unwrap(),
         ];
         assert!(requests.iter().all(|value| value["chatId"] == "chat-1"));
+    }
+
+    #[test]
+    fn workspace_content_search_round_trips() {
+        let request = SearchWorkspaceContentRequest {
+            target: WorkspaceTarget {
+                chat_id: Some("chat-1".into()),
+                space_id: None,
+                checkout_path: None,
+            },
+            query: "UserService".into(),
+            match_mode: WorkspaceContentMatchMode::Fuzzy,
+            include_ignored: true,
+            limit: Some(50),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "chatId": "chat-1",
+                "query": "UserService",
+                "matchMode": "fuzzy",
+                "includeIgnored": true,
+                "limit": 50,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SearchWorkspaceContentRequest>(value).unwrap(),
+            request
+        );
+
+        let response = SearchWorkspaceContentResponse {
+            matches: vec![WorkspaceContentSearchMatch {
+                path: "src/service.rs".into(),
+                line: 12,
+                preview: "pub struct UserService".into(),
+                preview_highlights: vec![WorkspaceContentHighlightRange { start: 12, end: 24 }],
+                line_match_start: 12,
+                line_match_end: 24,
+                match_text: "UserService".into(),
+                score: Some(84),
+            }],
+            files_scanned: 3,
+            skipped_binary: 1,
+            skipped_too_large: 0,
+            skipped_unsupported: 0,
+            skipped_errors: 0,
+            completion: WorkspaceContentSearchCompletion::ResultLimitReached,
+            incomplete_reason: None,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["completion"], "resultLimitReached");
+        assert_eq!(
+            serde_json::from_value::<SearchWorkspaceContentResponse>(value).unwrap(),
+            response
+        );
     }
 
     #[test]

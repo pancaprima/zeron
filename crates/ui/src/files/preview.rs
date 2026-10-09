@@ -574,6 +574,29 @@ impl FilesSurface {
     }
 
     /// A chat link can arrive before the file and editor have finished loading.
+    pub(crate) fn apply_open_file_location(
+        &mut self,
+        location: super::OpenFileLocation,
+        cx: &mut Context<Self>,
+    ) {
+        if location.line == 0 {
+            return;
+        }
+        self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
+        self.pending_line_column_unit = location.column_unit;
+        self.pending_line_navigation = Some((location.line, Some(location.match_start_column)));
+        self.pending_line_selection =
+            if location.column_unit == super::OpenFileColumnUnit::Utf32ScalarOffset {
+                Some((location.match_start_column, location.match_end_column))
+            } else {
+                None
+            };
+        self.pending_line_match_text = (!location.match_text.is_empty())
+            .then_some(location.match_text);
+        self.prepare_line_navigation(cx);
+        cx.notify();
+    }
+
     pub(crate) fn navigate_to_line(
         &mut self,
         line: u32,
@@ -584,7 +607,22 @@ impl FilesSurface {
             return;
         }
         self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
+        self.pending_line_column_unit = super::OpenFileColumnUnit::OneBasedLink;
         self.pending_line_navigation = Some((line, column));
+        self.pending_line_selection = None;
+        self.pending_line_match_text = None;
+        self.prepare_line_navigation(cx);
+        cx.notify();
+    }
+
+    fn editor_column(&self, column: u32) -> u32 {
+        match self.pending_line_column_unit {
+            super::OpenFileColumnUnit::OneBasedLink => column.saturating_sub(1),
+            super::OpenFileColumnUnit::Utf32ScalarOffset => column,
+        }
+    }
+
+    fn prepare_line_navigation(&mut self, cx: &mut Context<Self>) {
         if let Some(document) = self
             .editor_path
             .as_ref()
@@ -598,7 +636,6 @@ impl FilesSurface {
                 }
             }
         }
-        cx.notify();
     }
 
     fn apply_line_navigation(
@@ -625,18 +662,82 @@ impl FilesSurface {
             }
             return;
         }
+        let stale_message = self.content_navigation_stale_message(path, document);
         if let Some(editor) = editor {
-            editor.update(cx, |state, cx| {
-                let row = (line - 1).min(state.text().lines_len().saturating_sub(1) as u32);
-                state.set_cursor_position(
-                    gpui_base::input::Position::new(row, column.unwrap_or(1).saturating_sub(1)),
-                    window,
-                    cx,
-                );
-            });
+            if let Some(message) = stale_message {
+                self.error = Some(message);
+            } else {
+                editor.update(cx, |state, cx| {
+                    let row = (line - 1).min(state.text().lines_len().saturating_sub(1) as u32);
+                    let start_column = self
+                        .editor_column(column.unwrap_or_else(|| match self.pending_line_column_unit {
+                            super::OpenFileColumnUnit::OneBasedLink => 1,
+                            super::OpenFileColumnUnit::Utf32ScalarOffset => 0,
+                        }));
+                    state.set_cursor_position(
+                        gpui_base::input::Position::new(row, start_column),
+                        window,
+                        cx,
+                    );
+                    if let Some((start, end)) = self.pending_line_selection {
+                        let selection_start = self.editor_column(start);
+                        let selection_end = self.editor_column(end).max(selection_start + 1);
+                        let range_start = state
+                            .text()
+                            .position_to_offset(gpui_base::input::Position::new(row, selection_start));
+                        let range_end = state
+                            .text()
+                            .position_to_offset(gpui_base::input::Position::new(row, selection_end));
+                        state.set_selected_range(range_start..range_end, cx);
+                    }
+                });
+            }
+        } else if let Some(message) = stale_message {
+            self.error = Some(message);
         }
         self.pending_line_navigation = None;
+        self.pending_line_selection = None;
+        self.pending_line_match_text = None;
         self.schedule_line_center(line, self.line_navigation_generation, 16, window, cx);
+    }
+
+    fn content_navigation_stale_message(
+        &self,
+        _path: &str,
+        document: &super::document::FileDocument,
+    ) -> Option<SharedString> {
+        let expected = self.pending_line_match_text.as_deref()?;
+        if expected.is_empty() {
+            return None;
+        }
+        if document.is_dirty() {
+            return Some(
+                "This file has unsaved changes; content search reflects disk, not the open buffer."
+                    .into(),
+            );
+        }
+        let Some(text) = document.file.as_ref().and_then(|file| file.text.as_deref()) else {
+            return Some("Search result could not be verified because the file did not load.".into());
+        };
+        let line = self
+            .pending_line_navigation
+            .map(|(line, _)| line)
+            .unwrap_or(0);
+        let source_line = text.lines().nth(line.saturating_sub(1) as usize).unwrap_or("");
+        let (start, end) = self.pending_line_selection?;
+        let (start, end) = match self.pending_line_column_unit {
+            super::OpenFileColumnUnit::Utf32ScalarOffset => (start, end),
+            super::OpenFileColumnUnit::OneBasedLink => (start.saturating_sub(1), end.saturating_sub(1)),
+        };
+        let actual = source_line
+            .chars()
+            .skip(start as usize)
+            .take(end.saturating_sub(start) as usize)
+            .collect::<String>();
+        if actual != expected {
+            return Some("This search result is stale; the file changed on disk.".into());
+        }
+        None
     }
 
     fn schedule_line_center(
@@ -2592,7 +2693,9 @@ impl FilesSurface {
                         path.to_string(),
                         Rc::new(move |path, cx| {
                             let _ =
-                                owner.update(cx, |surface, cx| surface.open_tree_file(path, cx));
+                                owner.update(cx, |surface, cx| {
+                                    surface.open_tree_file(path, None, cx)
+                                });
                         }),
                         cx,
                     );

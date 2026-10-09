@@ -465,7 +465,7 @@ impl FilesSurface {
         if is_directory {
             self.toggle_tree_directory(path, cx);
         } else {
-            self.open_tree_file(path, cx);
+            self.open_tree_file(path, None, cx);
         }
         self.reveal_tree_selection();
         cx.notify();

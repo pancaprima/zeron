@@ -5,9 +5,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceFileSearchMatch,
-    WorkspaceFileText, WorkspaceTarget, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceContentRequest,
+    SearchWorkspaceContentResponse, SearchWorkspaceFilesRequest, WatchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceTarget,
+    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -177,6 +178,13 @@ impl WorkspaceFilesClient {
         request: SearchWorkspaceFilesRequest,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, FilesClientError> {
         self.call(methods::SEARCH_WORKSPACE_FILES, &request).await
+    }
+
+    pub async fn search_content(
+        &self,
+        request: SearchWorkspaceContentRequest,
+    ) -> Result<SearchWorkspaceContentResponse, FilesClientError> {
+        self.call(methods::SEARCH_WORKSPACE_CONTENT, &request).await
     }
 
     pub async fn read_file(

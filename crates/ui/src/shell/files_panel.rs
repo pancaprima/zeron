@@ -203,10 +203,15 @@ impl Shell {
                     {
                         this.start_file_mutation(source.clone(), intent.clone(), cx);
                     }
-                    FilesEvent::OpenFile(path)
+                    FilesEvent::OpenFile(request)
                         if this.accepts_file_navigation(&owner, &source, cx) =>
                     {
-                        this.add_file_surface(path.clone(), window, cx);
+                        this.add_file_surface(
+                            request.path.clone(),
+                            request.location.clone(),
+                            window,
+                            cx,
+                        );
                     }
                     FilesEvent::OpenWebLink(activation) => {
                         if let crate::markdown::render::LinkOutcome::External(url) =
@@ -527,8 +532,8 @@ mod tests {
                 assert!(shell.right_surface_rows(cx).is_empty());
                 shell.add_files_surface(window, cx);
                 assert_eq!(shell.files["first"].entity_id(), explorer);
-                shell.add_file_surface("src/main.rs".into(), window, cx);
-                shell.add_file_surface("src/main.rs".into(), window, cx);
+                shell.add_file_surface("src/main.rs".into(), None, window, cx);
+                shell.add_file_surface("src/main.rs".into(), None, window, cx);
                 assert_eq!(shell.file_surfaces.len(), 1);
                 assert_eq!(shell.right_surface_rows(cx).len(), 1);
                 assert!(shell.right_pane_open(cx));
@@ -606,7 +611,7 @@ mod tests {
 
                 // Opening a file docks the surface host beside the explorer;
                 // programmatic opens never close an open pane.
-                shell.add_file_surface("src/main.rs".into(), window, cx);
+                shell.add_file_surface("src/main.rs".into(), None, window, cx);
                 assert!(shell.right_pane_open(cx) && shell.files_panel_open(cx));
                 shell.set_surfaces_open(true, cx);
                 assert!(shell.right_pane_open(cx) && shell.files_panel_open(cx));
@@ -627,7 +632,7 @@ mod tests {
 
                 // With the explorer undocked, the last tab close closes the
                 // whole pane.
-                shell.add_file_surface("src/main.rs".into(), window, cx);
+                shell.add_file_surface("src/main.rs".into(), None, window, cx);
                 assert!(shell.right_pane_open(cx));
                 let file = shell.right_surface_rows(cx)[0].0;
                 shell.close_right_surface(file, window, cx);

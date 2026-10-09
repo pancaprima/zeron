@@ -43,6 +43,7 @@ mod transcript_history;
 pub mod uploads;
 pub mod voice;
 pub mod workspace_files;
+mod workspace_content_search;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
