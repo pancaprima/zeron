@@ -61,8 +61,7 @@ fn search_mode_chip(
     id: &'static str,
     label: &'static str,
     active: bool,
-    handler: impl Fn(&mut FilesSurface, &gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::Context<FilesSurface>)
-        + 'static,
+    handler: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {
     div()
         .id(id)
@@ -77,15 +76,13 @@ fn search_mode_chip(
         .role(gpui::Role::Button)
         .aria_label(label)
         .when(active, |element| element.bg(crate::theme::wash(0.14)))
-        .when(!active, |element| element.hover(|style| style.bg(crate::theme::wash(0.08))))
-        .on_mouse_down(gpui::MouseButton::Left, handler)
+        .when(!active, |element| {
+            element.hover(|style| style.bg(crate::theme::wash(0.08)))
+        })
+        .on_click(handler)
         .text_size(px(10.0))
         .font_family(theme.font_sans.clone())
-        .text_color(if active {
-            theme.text
-        } else {
-            theme.text_muted
-        })
+        .text_color(if active { theme.text } else { theme.text_muted })
         .child(label)
         .into_any_element()
 }

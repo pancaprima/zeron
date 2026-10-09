@@ -3,6 +3,16 @@ use std::{
     time::Duration,
 };
 
+use super::{
+    FilesSurface, OpenFileColumnUnit, OpenFileLocation, WorkspacePathDrag,
+    client::FilesClientError, client::WorkspaceFilesClient, model::parent_path,
+    workspace_path_drag_ghost,
+};
+use crate::{
+    file_icons::{self, FileIconIdentity},
+    icons::{self, icon},
+    theme::Theme,
+};
 use gpui::{
     AnyElement, Context, ListSizingBehavior, SharedString, Task, Window, div, list, prelude::*, px,
 };
@@ -11,15 +21,6 @@ use zeron_proto::{
     WorkspaceContentMatchMode, WorkspaceContentSearchCompletion,
     WorkspaceContentSearchIncompleteReason, WorkspaceContentSearchMatch, WorkspaceEntryKind,
     WorkspaceFileSearchMatch,
-};
-use super::{
-    FilesSurface, OpenFileColumnUnit, OpenFileLocation, WorkspacePathDrag, client::FilesClientError,
-    client::WorkspaceFilesClient, model::parent_path, workspace_path_drag_ghost,
-};
-use crate::{
-    file_icons::{self, FileIconIdentity},
-    icons::{self, icon},
-    theme::Theme,
 };
 
 pub const SEARCH_ROW_HEIGHT: f32 = 27.0;
@@ -457,8 +458,7 @@ impl FilesSurface {
                         surface.search_state.tree.clear();
                         surface.search_state.content_results = response.matches;
                         surface.search_state.content_completion = Some(response.completion);
-                        surface.search_state.content_incomplete_reason =
-                            response.incomplete_reason;
+                        surface.search_state.content_incomplete_reason = response.incomplete_reason;
                         surface.search_state.active = 0;
                     }
                     Err(error) => {
@@ -469,10 +469,9 @@ impl FilesSurface {
                     }
                 }
                 let (count, row_height) = match surface.search_state.kind {
-                    ExplorerSearchKind::Files => (
-                        surface.search_state.tree.rows().len(),
-                        SEARCH_ROW_HEIGHT,
-                    ),
+                    ExplorerSearchKind::Files => {
+                        (surface.search_state.tree.rows().len(), SEARCH_ROW_HEIGHT)
+                    }
                     ExplorerSearchKind::Contents => (
                         surface.search_state.content_results.len(),
                         SEARCH_CONTENT_ROW_HEIGHT,
@@ -789,7 +788,7 @@ impl FilesSurface {
         );
         div()
             .id("files-content-search-results")
-            .role(gpui::Role::Listbox)
+            .role(gpui::Role::ListBox)
             .aria_label("Workspace content search results")
             .flex_1()
             .min_h_0()
@@ -829,7 +828,7 @@ impl FilesSurface {
         let header = format!("{}:{}", result.path, result.line);
         div()
             .id(("files-content-search-result", index))
-            .role(gpui::Role::Option)
+            .role(gpui::Role::ListBoxOption)
             .aria_label(header.clone())
             .aria_selected(selected)
             .h(px(SEARCH_CONTENT_ROW_HEIGHT))
@@ -857,12 +856,9 @@ impl FilesSurface {
                     .gap(px(6.0))
                     .overflow_hidden()
                     .child(
-                        file_icons::icon(
-                            FileIconIdentity::file(file_name),
-                            theme.appearance,
-                        )
-                        .size(px(14.0))
-                        .flex_none(),
+                        file_icons::icon(FileIconIdentity::file(file_name), theme.appearance)
+                            .size(px(14.0))
+                            .flex_none(),
                     )
                     .child(
                         div()
@@ -886,7 +882,11 @@ impl FilesSurface {
                     .overflow_hidden()
                     .text_size(px(10.0))
                     .text_color(theme.text_muted)
-                    .child(render_preview_highlights(&result.preview, &result.preview_highlights, theme)),
+                    .child(render_preview_highlights(
+                        &result.preview,
+                        &result.preview_highlights,
+                        &theme,
+                    )),
             )
             .into_any_element()
     }
@@ -1011,17 +1011,13 @@ fn content_search_status_message(
         Some(WorkspaceContentSearchCompletion::ResultLimitReached) => {
             Some("Showing the first 200 matches")
         }
-        Some(WorkspaceContentSearchCompletion::ScanIncomplete) => {
-            match incomplete_reason {
-                Some(WorkspaceContentSearchIncompleteReason::ScanBudgetExceeded) => {
-                    Some("Scan stopped early; results may be incomplete")
-                }
-                Some(WorkspaceContentSearchIncompleteReason::Cancelled) => {
-                    Some("Scan was cancelled")
-                }
-                None => Some("Scan incomplete"),
+        Some(WorkspaceContentSearchCompletion::ScanIncomplete) => match incomplete_reason {
+            Some(WorkspaceContentSearchIncompleteReason::ScanBudgetExceeded) => {
+                Some("Scan stopped early; results may be incomplete")
             }
-        }
+            Some(WorkspaceContentSearchIncompleteReason::Cancelled) => Some("Scan was cancelled"),
+            None => Some("Scan incomplete"),
+        },
         _ => None,
     }
 }
@@ -1039,20 +1035,24 @@ fn render_preview_highlights(
     for range in highlights {
         let start = range.start as usize;
         let end = range.end as usize;
-        if start < cursor || end > preview.len() || !preview.is_char_boundary(start) || !preview.is_char_boundary(end) {
+        if start < cursor
+            || end > preview.len()
+            || !preview.is_char_boundary(start)
+            || !preview.is_char_boundary(end)
+        {
             continue;
         }
         if start > cursor {
             elements.push(
                 div()
-                    .inline()
+                    .flex_none()
                     .child(preview[cursor..start].to_string())
                     .into_any_element(),
             );
         }
         elements.push(
             div()
-                .inline()
+                .flex_none()
                 .bg(crate::theme::wash(0.18))
                 .text_color(theme.text)
                 .child(preview[start..end].to_string())
@@ -1063,12 +1063,17 @@ fn render_preview_highlights(
     if cursor < preview.len() {
         elements.push(
             div()
-                .inline()
+                .flex_none()
                 .child(preview[cursor..].to_string())
                 .into_any_element(),
         );
     }
-    div().truncate().flex().children(elements).into_any_element()
+    div()
+        .truncate()
+        .flex()
+        .flex_row()
+        .children(elements)
+        .into_any_element()
 }
 
 fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyElement {

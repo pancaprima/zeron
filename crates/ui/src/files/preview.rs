@@ -684,10 +684,10 @@ impl FilesSurface {
                         let selection_end = self.editor_column(end).max(selection_start + 1);
                         let range_start = state
                             .text()
-                            .position_to_offset(gpui_base::input::Position::new(row, selection_start));
+                            .position_to_offset(&gpui_base::input::Position::new(row, selection_start));
                         let range_end = state
                             .text()
-                            .position_to_offset(gpui_base::input::Position::new(row, selection_end));
+                            .position_to_offset(&gpui_base::input::Position::new(row, selection_end));
                         state.set_selected_range(range_start..range_end, cx);
                     }
                 });
