@@ -6,8 +6,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use zeron_engine::workspace_content_index::{
-    ContentIndexEnvConfig, ContentIndexManager, content_index_reads_enabled,
-    parse_content_index_env_flag, wait_for_index_ready,
+    ContentIndexEnvConfig, ContentIndexManager, parse_content_index_env_flag,
+    parse_content_index_reads_flag, wait_for_index_ready,
 };
 use zeron_proto::{WorkspaceContentMatchMode, WorkspaceFileChange, WorkspaceFileChangeKind};
 
@@ -37,8 +37,15 @@ fn fixture_tree(root: &Path) {
 }
 
 #[test]
-fn content_index_reads_disabled_by_default() {
-    assert!(!content_index_reads_enabled());
+fn content_index_reads_enabled_by_default_with_opt_out() {
+    assert!(parse_content_index_reads_flag(None));
+    assert!(parse_content_index_reads_flag(Some("")));
+    assert!(!parse_content_index_reads_flag(Some("0")));
+    assert!(!parse_content_index_reads_flag(Some("false")));
+    assert!(!parse_content_index_reads_flag(Some("OFF")));
+    assert!(parse_content_index_reads_flag(Some("1")));
+    assert!(parse_content_index_reads_flag(Some("true")));
+    assert!(parse_content_index_reads_flag(Some("weird")));
     assert!(!parse_content_index_env_flag(None));
     assert!(!parse_content_index_env_flag(Some("0")));
     assert!(parse_content_index_env_flag(Some("1")));

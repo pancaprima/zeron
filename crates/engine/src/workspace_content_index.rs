@@ -1,7 +1,8 @@
 //! Background SQLite line cache for workspace content search (Option B).
 //!
-//! Indexed reads are gated behind [`content_index_reads_enabled`] until freshness
-//! invariants hold. The scanner in `workspace_content_search` remains the fallback.
+//! Indexed reads are **on by default** ([`content_index_reads_enabled`]); opt out via
+//! `ZERONA_CONTENT_INDEX`. The scanner in `workspace_content_search` remains the fallback
+//! when the index is not ready or the revision is stale.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -62,9 +63,25 @@ pub fn parse_content_index_env_flag(value: Option<&str>) -> bool {
     )
 }
 
-/// Default **off** until Stage 3 parity + benchmark gate pass.
+/// Parse `ZERONA_CONTENT_INDEX` read enablement (default **on**, opt-out).
+pub fn parse_content_index_reads_flag(value: Option<&str>) -> bool {
+    match value {
+        Some(v)
+            if v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no") =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Indexed reads default **on**; set `ZERONA_CONTENT_INDEX` to `0`/`false`/`off`/`no` to disable.
+/// The scanner remains the fallback when the index is not ready or the revision is stale.
 pub fn content_index_reads_enabled() -> bool {
-    parse_content_index_env_flag(std::env::var("ZERONA_CONTENT_INDEX").ok().as_deref())
+    parse_content_index_reads_flag(std::env::var("ZERONA_CONTENT_INDEX").ok().as_deref())
 }
 
 /// Background writer (disk/CPU). Off in production unless reads are on or explicit bench opt-in.
