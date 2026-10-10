@@ -25,6 +25,7 @@ use zeron_proto::{
 };
 use zeron_rpc::RpcError;
 
+use crate::workspace_content_index::{ContentIndexManager, ForegroundSearchGuard};
 use crate::{Repos, WorkspaceHost};
 
 mod mutations;
@@ -58,6 +59,7 @@ struct WorkspaceFilesInner {
     mutation_gates: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     write_locks: Mutex<HashMap<WorkspaceFileKey, Weak<tokio::sync::Mutex<()>>>>,
     watches: Mutex<HashMap<String, Arc<CheckoutWatch>>>,
+    content_index: Arc<ContentIndexManager>,
     cancel: CancellationToken,
 }
 
@@ -77,6 +79,8 @@ struct CheckoutWatch {
     cancel: CancellationToken,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    index_bridge: Arc<Mutex<Option<Arc<crate::workspace_content_index::ContentIndexWatchBridge>>>>,
+    index_listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 pub struct WorkspaceFileSubscription {
@@ -240,7 +244,12 @@ fn plain_folder_identity(device_id: &str, root: &Path) -> String {
 }
 
 impl WorkspaceFiles {
-    pub fn new(repos: Repos, workspace: WorkspaceHost, device_id: impl Into<String>) -> Self {
+    pub fn new(
+        repos: Repos,
+        workspace: WorkspaceHost,
+        device_id: impl Into<String>,
+        content_index: Arc<ContentIndexManager>,
+    ) -> Self {
         Self {
             inner: Arc::new(WorkspaceFilesInner {
                 repos,
@@ -249,6 +258,7 @@ impl WorkspaceFiles {
                 mutation_gates: Mutex::new(HashMap::new()),
                 write_locks: Mutex::new(HashMap::new()),
                 watches: Mutex::new(HashMap::new()),
+                content_index,
                 cancel: CancellationToken::new(),
             }),
         }
@@ -445,15 +455,46 @@ impl WorkspaceFiles {
         let match_mode = request.match_mode;
         let query = request.query.clone();
         let include_ignored = request.include_ignored;
+        let checkout_id = workspace.checkout_id.clone();
+        let root = workspace.root.clone();
+        let content_index = self.inner.content_index.clone();
+        content_index.ensure_profile_writer(&checkout_id, &root, include_ignored);
+        let indexed_revision = content_index.can_serve_indexed_read(&checkout_id, include_ignored);
+        let index_in_worker = content_index.clone();
         let result = tokio::task::spawn_blocking(move || {
-            crate::workspace_content_search::search_workspace_content_blocking(
-                &workspace.root,
-                &query,
-                match_mode,
-                include_ignored,
-                limit,
-                &cancel,
-            )
+            let _foreground = ForegroundSearchGuard::enter(&index_in_worker);
+            let search_result = if let Some(revision) = indexed_revision {
+                match index_in_worker.search_indexed(
+                    &checkout_id,
+                    &root,
+                    &query,
+                    match_mode,
+                    include_ignored,
+                    limit,
+                    &cancel,
+                    revision,
+                ) {
+                    Ok(response) => Ok(response),
+                    Err(_) => crate::workspace_content_search::search_workspace_content_blocking(
+                        &root,
+                        &query,
+                        match_mode,
+                        include_ignored,
+                        limit,
+                        &cancel,
+                    ),
+                }
+            } else {
+                crate::workspace_content_search::search_workspace_content_blocking(
+                    &root,
+                    &query,
+                    match_mode,
+                    include_ignored,
+                    limit,
+                    &cancel,
+                )
+            };
+            search_result
         })
         .await
         .map_err(|error| WorkspaceFilesError::Io(format!("content search worker failed: {error}")))?;
@@ -618,11 +659,55 @@ impl WorkspaceFiles {
                 lock(&candidate.watcher).take();
                 existing.subscribe(Arc::downgrade(&self.inner))
             } else {
-                watches.insert(workspace.checkout_id, candidate.clone());
+                watches.insert(workspace.checkout_id.clone(), candidate.clone());
+                self.attach_content_index_listener(
+                    &workspace.checkout_id,
+                    &candidate.root,
+                    &candidate,
+                );
                 candidate.subscribe(Arc::downgrade(&self.inner))
             }
         };
         Ok(subscription)
+    }
+
+    fn attach_content_index_listener(
+        &self,
+        checkout_id: &str,
+        root: &Path,
+        watch: &Arc<CheckoutWatch>,
+    ) {
+        let index = self.inner.content_index.clone();
+        let bridge = index.watch_bridge(checkout_id);
+        *lock(&watch.index_bridge) = Some(bridge.clone());
+        index.on_watch_activated(checkout_id.to_string(), root.to_path_buf(), bridge);
+        let mut receiver = watch.changes_tx.subscribe();
+        let checkout_id = checkout_id.to_string();
+        let root = root.to_path_buf();
+        let watch_cancel = watch.cancel.clone();
+        let listener = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watch_cancel.cancelled() => break,
+                    received = receiver.recv() => match received {
+                        Ok(changes) => index.on_watch_changes(&checkout_id, &root, &changes),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            index.on_watch_changes(
+                                &checkout_id,
+                                &root,
+                                &WorkspaceFileChanges {
+                                    sequence: 0,
+                                    resync_required: true,
+                                    changes: Vec::new(),
+                                },
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        });
+        *lock(&watch.index_listener) = Some(listener);
     }
 
     /// Cancel all service-owned work. This operation is idempotent.
@@ -641,10 +726,14 @@ impl WorkspaceFiles {
             if let Some(task) = lock(&watch.task).take() {
                 tasks.push(task);
             }
+            if let Some(task) = lock(&watch.index_listener).take() {
+                tasks.push(task);
+            }
         }
         for task in tasks {
             let _ = task.await;
         }
+        self.inner.content_index.shutdown();
         lock(&self.inner.write_locks).clear();
     }
 }
@@ -658,6 +747,8 @@ impl CheckoutWatch {
     ) -> Arc<Self> {
         let (changes_tx, _) = broadcast::channel(WATCH_BROADCAST_BUFFER);
         let (event_tx, event_rx) = mpsc::channel(WATCH_EVENT_BUFFER);
+        let index_bridge: Arc<Mutex<Option<Arc<crate::workspace_content_index::ContentIndexWatchBridge>>>> =
+            Arc::new(Mutex::new(None));
         let overflow = Arc::new(AtomicBool::new(false));
         let overflow_notify = Arc::new(Notify::new());
         let watcher = if over_budget {
@@ -665,12 +756,16 @@ impl CheckoutWatch {
         } else {
             let callback_overflow = overflow.clone();
             let callback_notify = overflow_notify.clone();
+            let callback_bridge = index_bridge.clone();
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 if event
                     .as_ref()
                     .is_ok_and(|event| matches!(event.kind, notify::EventKind::Access(_)))
                 {
                     return;
+                }
+                if let Some(bridge) = callback_bridge.lock().expect("index bridge").clone() {
+                    bridge.on_raw_fs_activity();
                 }
                 let event = TimedWatchEvent {
                     received_at: Instant::now(),
@@ -704,6 +799,8 @@ impl CheckoutWatch {
             cancel,
             watcher: Mutex::new(watcher),
             task: Mutex::new(None),
+            index_bridge,
+            index_listener: Mutex::new(None),
         });
         let task = tokio::spawn(watch_task(
             Arc::downgrade(&watch),
@@ -896,6 +993,8 @@ async fn watch_task(
                 );
                 if resync_required || !changes.is_empty() {
                     watch.publish(resync_required, changes);
+                } else if event_count > 0 {
+                    watch.publish(true, Vec::new());
                 }
             }
         }

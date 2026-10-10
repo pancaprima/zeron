@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use ignore::WalkBuilder;
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use sha2::{Digest, Sha256};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use zeron_proto::{
     SearchWorkspaceContentResponse, WorkspaceContentHighlightRange, WorkspaceContentMatchMode,
@@ -33,15 +34,15 @@ pub const CONTENT_SEARCH_SCAN_DEADLINE: std::time::Duration =
     std::time::Duration::from_millis(4_500);
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-struct ScanBudget {
+pub struct ScanBudgetState {
     started: Instant,
     bytes_scanned: u64,
     max_bytes: u64,
     deadline: std::time::Duration,
 }
 
-impl ScanBudget {
-    fn new() -> Self {
+impl ScanBudgetState {
+    pub fn new() -> Self {
         Self {
             started: Instant::now(),
             bytes_scanned: 0,
@@ -50,12 +51,12 @@ impl ScanBudget {
         }
     }
 
-    fn record(&mut self, bytes: u64) -> bool {
+    pub fn record(&mut self, bytes: u64) -> bool {
         self.bytes_scanned += bytes;
         self.bytes_scanned <= self.max_bytes && self.started.elapsed() <= self.deadline
     }
 
-    fn exhausted(&self) -> bool {
+    pub fn exhausted(&self) -> bool {
         self.bytes_scanned >= self.max_bytes || self.started.elapsed() > self.deadline
     }
 }
@@ -87,7 +88,7 @@ pub fn search_workspace_content_blocking(
         !name.to_string_lossy().eq_ignore_ascii_case(".git")
     });
 
-    let mut budget = ScanBudget::new();
+    let mut budget = ScanBudgetState::new();
     let mut matches = Vec::new();
     let mut files_scanned = 0u32;
     let mut skipped_binary = 0u32;
@@ -204,12 +205,38 @@ pub fn search_workspace_content_blocking(
         }
     }
 
+    Ok(build_search_response(
+        matches,
+        mode,
+        limit,
+        files_scanned,
+        skipped_binary,
+        skipped_too_large,
+        skipped_unsupported,
+        skipped_errors,
+        scan_incomplete,
+        incomplete_reason,
+        hit_result_cap,
+    ))
+}
+
+pub fn build_search_response(
+    mut matches: Vec<WorkspaceContentSearchMatch>,
+    mode: WorkspaceContentMatchMode,
+    limit: usize,
+    files_scanned: u32,
+    skipped_binary: u32,
+    skipped_too_large: u32,
+    skipped_unsupported: u32,
+    skipped_errors: u32,
+    scan_incomplete: bool,
+    incomplete_reason: Option<WorkspaceContentSearchIncompleteReason>,
+    hit_result_cap: bool,
+) -> SearchWorkspaceContentResponse {
     sort_matches(&mut matches, mode);
     if matches.len() > limit {
         matches.truncate(limit);
-        hit_result_cap = true;
     }
-
     let completion = if scan_incomplete {
         WorkspaceContentSearchCompletion::ScanIncomplete
     } else if hit_result_cap {
@@ -217,8 +244,7 @@ pub fn search_workspace_content_blocking(
     } else {
         WorkspaceContentSearchCompletion::Complete
     };
-
-    Ok(SearchWorkspaceContentResponse {
+    SearchWorkspaceContentResponse {
         matches,
         files_scanned,
         skipped_binary,
@@ -227,7 +253,170 @@ pub fn search_workspace_content_blocking(
         skipped_errors,
         completion,
         incomplete_reason,
+    }
+}
+
+pub fn content_search_walk_builder(root: &Path, include_ignored: bool) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder.follow_links(false).hidden(false);
+    if include_ignored {
+        builder.standard_filters(false);
+    }
+    builder.filter_entry(|entry| {
+        let name = entry.file_name();
+        !name.to_string_lossy().eq_ignore_ascii_case(".git")
+    });
+    builder
+}
+
+pub struct CollectedFileLines {
+    pub lines: Vec<(u32, String)>,
+    pub skipped_binary: bool,
+    pub skipped_unsupported: bool,
+    pub content_hash: Vec<u8>,
+}
+
+pub fn collect_file_lines_for_index(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+    wire_path: &str,
+) -> Result<CollectedFileLines, WorkspaceFilesError> {
+    let path = root.join(relative.as_path());
+    let initial_metadata = metadata_for_workspace_file(root, wire_path)?;
+    if initial_metadata.len() > CONTENT_SEARCH_MAX_BYTES_PER_FILE {
+        return Ok(CollectedFileLines {
+            lines: Vec::new(),
+            skipped_binary: false,
+            skipped_unsupported: false,
+            content_hash: Vec::new(),
+        });
+    }
+    let file = File::open(&path).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    let mut reader = BufReader::new(file);
+    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    let mut lines = LineBuffer::new();
+    let mut bytes_read_from_file = 0u64;
+    let file_byte_cap = initial_metadata
+        .len()
+        .min(CONTENT_SEARCH_MAX_BYTES_PER_FILE);
+    let mut saw_binary = false;
+    let mut hasher = Sha256::new();
+    let mut collected = Vec::new();
+
+    loop {
+        if bytes_read_from_file >= file_byte_cap {
+            break;
+        }
+        let read = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return Err(WorkspaceFilesError::Io("read failed".into())),
+        };
+        let read = read.min((file_byte_cap - bytes_read_from_file) as usize);
+        hasher.update(&chunk[..read]);
+        bytes_read_from_file += read as u64;
+        let mut process_len = read;
+        if let Some(nul_pos) = chunk[..read].iter().position(|&b| b == b'\0') {
+            saw_binary = true;
+            process_len = nul_pos;
+        }
+
+        let mut chunk_slice = &chunk[..process_len];
+        if lines.skipping_oversized {
+            if let Some(split) = chunk_slice.iter().position(|&b| b == b'\n') {
+                chunk_slice = &chunk_slice[split + 1..];
+                lines.on_newline();
+            } else {
+                if saw_binary {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        lines.carry.extend_from_slice(chunk_slice);
+        while let Some(split) = lines.carry.iter().position(|&b| b == b'\n') {
+            let mut line_bytes = lines.carry.drain(..=split).collect::<Vec<_>>();
+            let _had_newline = line_bytes.pop() == Some(b'\n');
+            lines.on_newline();
+            lines.begin_line();
+            if line_bytes.len() > CONTENT_SEARCH_MAX_LINE_BYTES {
+                continue;
+            }
+            match std::str::from_utf8(strip_crlf(&line_bytes)) {
+                Ok(line) => collected.push((lines.line_number, line.to_string())),
+                Err(_) => lines.saw_invalid_utf8 = true,
+            }
+        }
+
+        if lines.carry.len() > CONTENT_SEARCH_MAX_LINE_BYTES {
+            lines.begin_line();
+            lines.skipping_oversized = true;
+            lines.carry.clear();
+        }
+        if saw_binary {
+            break;
+        }
+    }
+
+    if !lines.skipping_oversized && !lines.carry.is_empty() {
+        lines.begin_line();
+        if lines.carry.len() <= CONTENT_SEARCH_MAX_LINE_BYTES {
+            match std::str::from_utf8(strip_crlf(&lines.carry)) {
+                Ok(line) => collected.push((lines.line_number, line.to_string())),
+                Err(_) => lines.saw_invalid_utf8 = true,
+            }
+        }
+    }
+
+    Ok(CollectedFileLines {
+        lines: collected,
+        skipped_binary: saw_binary,
+        skipped_unsupported: lines.saw_invalid_utf8,
+        content_hash: hasher.finalize().to_vec(),
     })
+}
+
+pub struct ContentLineMatcher {
+    query_lower: String,
+    fuzzy: Option<FuzzyLineMatcher>,
+    mode: WorkspaceContentMatchMode,
+}
+
+impl ContentLineMatcher {
+    pub fn new(query: &str, mode: WorkspaceContentMatchMode) -> Result<Self, WorkspaceFilesError> {
+        validate_workspace_search_query(query)?;
+        Ok(Self {
+            query_lower: query.to_lowercase(),
+            fuzzy: match mode {
+                WorkspaceContentMatchMode::Literal => None,
+                WorkspaceContentMatchMode::Fuzzy => Some(FuzzyLineMatcher::new(query)),
+            },
+            mode,
+        })
+    }
+
+    pub fn match_line(
+        &mut self,
+        wire_path: &str,
+        line_number: u32,
+        line_bytes: &[u8],
+        matches: &mut Vec<WorkspaceContentSearchMatch>,
+        limit: usize,
+        hit_result_cap: &mut bool,
+    ) {
+        let _ = process_line(
+            wire_path,
+            line_number,
+            line_bytes,
+            &self.query_lower,
+            self.fuzzy.as_mut(),
+            matches,
+            limit,
+            hit_result_cap,
+            self.mode,
+        );
+    }
 }
 
 fn empty_response() -> SearchWorkspaceContentResponse {
@@ -289,7 +478,7 @@ fn scan_file_lines(
     limit: usize,
     matches: &mut Vec<WorkspaceContentSearchMatch>,
     hit_result_cap: &mut bool,
-    budget: &mut ScanBudget,
+    budget: &mut ScanBudgetState,
     cancel: &AtomicBool,
 ) -> FileScanOutcome {
     let path = root.join(relative.as_path());
@@ -334,21 +523,20 @@ fn scan_file_lines(
             process_len = nul_pos;
         }
 
+        let mut chunk_slice = &chunk[..process_len];
         if lines.skipping_oversized {
-            if let Some(split) = chunk[..process_len].iter().position(|&b| b == b'\n') {
-                lines.carry.clear();
-                lines
-                    .carry
-                    .extend_from_slice(&chunk[split + 1..process_len]);
+            if let Some(split) = chunk_slice.iter().position(|&b| b == b'\n') {
+                chunk_slice = &chunk_slice[split + 1..];
                 lines.on_newline();
+            } else {
+                if saw_binary {
+                    break;
+                }
+                continue;
             }
-            if saw_binary {
-                break;
-            }
-            continue;
         }
 
-        lines.carry.extend_from_slice(&chunk[..process_len]);
+        lines.carry.extend_from_slice(chunk_slice);
         while let Some(split) = lines.carry.iter().position(|&b| b == b'\n') {
             let mut line_bytes = lines.carry.drain(..=split).collect::<Vec<_>>();
             let _had_newline = line_bytes.pop() == Some(b'\n');
@@ -1024,6 +1212,27 @@ mod tests {
         assert_eq!(highlights.len(), 1);
         assert_eq!(highlights[0].start, 5);
         assert_eq!(highlights[0].end, 9);
+    }
+
+    #[test]
+    fn collect_file_lines_oversized_spans_chunks_before_needle() {
+        let root = tempfile::tempdir().unwrap();
+        let padding = "x".repeat(READ_CHUNK_BYTES + 100);
+        std::fs::write(
+            root.path().join("chunked.txt"),
+            format!("{padding}\nneedle\n"),
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let relative = WorkspaceRelativePath::file("chunked.txt").unwrap();
+        let collected = collect_file_lines_for_index(&root, &relative, "chunked.txt").unwrap();
+        let needle_lines = collected
+            .lines
+            .iter()
+            .filter(|(_, text)| text.contains("needle"))
+            .count();
+        assert_eq!(needle_lines, 1);
+        assert_eq!(collected.lines.iter().find(|(_, t)| t == "needle").unwrap().0, 2);
     }
 
     #[test]
