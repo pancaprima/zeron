@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template for Zeron.app/Contents/Info.plist — see dist/README.md for the
+<!-- Template for Zerona.app/Contents/Info.plist — see dist/README.md for the
      bundling steps. Replace __VERSION__ before packaging. -->
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>Zeron</string>
+    <string>Zerona</string>
     <key>CFBundleExecutable</key>
     <string>zeron</string>
     <key>CFBundleIconFile</key>
@@ -17,7 +17,7 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Zeron</string>
+    <string>Zerona</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -38,7 +38,7 @@
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Zeron uses your microphone for on-device dictation and for voice sessions you start. Voice sessions stream your audio to OpenAI through your ChatGPT-authenticated Codex account.</string>
+    <string>Zerona uses your microphone for on-device dictation and for voice sessions you start. Voice sessions stream your audio to OpenAI through your ChatGPT-authenticated Codex account.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <!-- Browser tabs load user-selected HTTP dev servers. Keep the exception

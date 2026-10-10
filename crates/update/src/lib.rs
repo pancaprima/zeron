@@ -398,12 +398,12 @@ impl std::fmt::Display for UpdateBlocker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Translocated | Self::DiskImage => f.write_str(
-                "Zeron is running from a temporary, read-only location. Move Zeron to your \
+                "Zerona is running from a temporary, read-only location. Move Zerona to your \
                  Applications folder and reopen it to turn on updates.",
             ),
             Self::NotWritable(dir) => write!(
                 f,
-                "Zeron doesn't have permission to replace itself in {}.",
+                "Zerona doesn't have permission to replace itself in {}.",
                 dir.display()
             ),
         }
@@ -838,7 +838,20 @@ pub fn restart_service() -> anyhow::Result<()> {
 // macOS app-bundle installs — the desktop path
 // ---------------------------------------------------------------------------
 
-/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Zeron.app`
+const MAC_APP_BUNDLE_NAMES: [&str; 2] = ["Zerona.app", "Zeron.app"];
+
+/// Prefer `Zerona.app` in an unpacked tarball; accept legacy `Zeron.app`.
+fn mac_app_bundle_in_dir(dir: &Path) -> Option<PathBuf> {
+    for name in MAC_APP_BUNDLE_NAMES {
+        let bundle = dir.join(name);
+        if bundle.join("Contents/MacOS/zeron").is_file() {
+            return Some(bundle);
+        }
+    }
+    None
+}
+
+/// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Zerona.app`
 /// (idempotent). The bundle is unpacked beside its final name and renamed in
 /// only after its binary answers with the expected version, so an interrupted
 /// unpack can never be mistaken for a staged update. Returns the staged bundle.
@@ -856,7 +869,7 @@ pub async fn stage_mac_app(
     );
     let updates = data_dir.join("updates");
     let dir = updates.join(version);
-    let staged = dir.join("Zeron.app");
+    let staged = dir.join("Zerona.app");
     let staged_binary = staged.join("Contents/MacOS/zeron");
     if staged_binary.exists() && verify_staged_binary(&staged_binary, version).await.is_ok() {
         return Ok(staged);
@@ -869,7 +882,7 @@ pub async fn stage_mac_app(
     download_release_file(edge_url, manifest, &file, &tarball).await?;
     let unpack = dir.join(".unpack");
     std::fs::create_dir_all(&unpack)?;
-    let unpacked = run(
+    run(
         "tar",
         &[
             "-xzf",
@@ -877,15 +890,13 @@ pub async fn stage_mac_app(
             "-C",
             &unpack.to_string_lossy(),
         ],
-    )
-    .map(|()| unpack.join("Zeron.app"));
+    )?;
     std::fs::remove_file(&tarball).ok();
-    let unpacked = unpacked?;
-    let unpacked_binary = unpacked.join("Contents/MacOS/zeron");
-    if !unpacked_binary.exists() {
+    let unpacked = mac_app_bundle_in_dir(&unpack).ok_or_else(|| {
         let _ = std::fs::remove_dir_all(&dir);
-        bail!("app tarball {file} did not contain Zeron.app");
-    }
+        anyhow::anyhow!("app tarball {file} did not contain Zerona.app or Zeron.app")
+    })?;
+    let unpacked_binary = unpacked.join("Contents/MacOS/zeron");
     if let Err(err) = verify_staged_binary(&unpacked_binary, version).await {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(err);
@@ -1673,12 +1684,12 @@ mod tests {
         );
         assert_eq!(
             detect_install_from_for_os(
-                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
+                Path::new("/Applications/Zerona.app/Contents/MacOS/zeron"),
                 Some(Path::new("/Users/u")),
                 "macos",
             ),
             InstallKind::MacApp {
-                bundle: PathBuf::from("/Applications/Zeron.app")
+                bundle: PathBuf::from("/Applications/Zerona.app")
             }
         );
         // A path merely containing `.app` without the bundle layout is not a bundle.
@@ -1755,7 +1766,7 @@ mod tests {
                 .contains("not supported on windows")
         );
         assert!(
-            apply_mac_app(&data_dir.join("Zeron.app"), &data_dir.join("Installed.app"))
+            apply_mac_app(&data_dir.join("Zerona.app"), &data_dir.join("Installed.app"))
                 .unwrap_err()
                 .to_string()
                 .contains("not supported on windows")
@@ -1918,7 +1929,7 @@ mod tests {
         apply_headless(&app_root, "0.4.0").unwrap();
         assert_eq!(installed_version(&managed).as_deref(), Some("0.4.0"));
 
-        let bundle = tmp.path().join("Zeron.app");
+        let bundle = tmp.path().join("Zerona.app");
         std::fs::create_dir_all(bundle.join("Contents")).unwrap();
         std::fs::write(
             bundle.join("Contents/Info.plist"),
@@ -1933,31 +1944,52 @@ mod tests {
     }
 
     #[test]
+    fn mac_app_bundle_in_dir_prefers_zerona_and_falls_back_to_zeron() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("Zeron.app/Contents/MacOS");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("zeron"), b"").unwrap();
+        assert_eq!(
+            mac_app_bundle_in_dir(tmp.path()),
+            Some(tmp.path().join("Zeron.app"))
+        );
+
+        let modern = tmp.path().join("Zerona.app/Contents/MacOS");
+        std::fs::create_dir_all(&modern).unwrap();
+        std::fs::write(modern.join("zeron"), b"").unwrap();
+        assert_eq!(
+            mac_app_bundle_in_dir(tmp.path()),
+            Some(tmp.path().join("Zerona.app"))
+        );
+        assert_eq!(mac_app_bundle_in_dir(&tmp.path().join("missing")), None);
+    }
+
+    #[test]
     fn mac_bundles_that_cannot_replace_themselves_are_explained() {
         let writable = |_: &Path| true;
         let read_only = |_: &Path| false;
         assert_eq!(
-            mac_bundle_blocker(Path::new("/Applications/Zeron.app"), writable),
+            mac_bundle_blocker(Path::new("/Applications/Zerona.app"), writable),
             None
         );
         assert_eq!(
             mac_bundle_blocker(
-                Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/Zeron.app"),
+                Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/Zerona.app"),
                 writable
             ),
             Some(UpdateBlocker::Translocated)
         );
         assert_eq!(
-            mac_bundle_blocker(Path::new("/Volumes/Zeron/Zeron.app"), read_only),
+            mac_bundle_blocker(Path::new("/Volumes/Zerona/Zerona.app"), read_only),
             Some(UpdateBlocker::DiskImage)
         );
         // An external drive the user can write to updates in place.
         assert_eq!(
-            mac_bundle_blocker(Path::new("/Volumes/Work/Zeron.app"), writable),
+            mac_bundle_blocker(Path::new("/Volumes/Work/Zerona.app"), writable),
             None
         );
         assert_eq!(
-            mac_bundle_blocker(Path::new("/Applications/Zeron.app"), read_only),
+            mac_bundle_blocker(Path::new("/Applications/Zerona.app"), read_only),
             Some(UpdateBlocker::NotWritable(PathBuf::from("/Applications")))
         );
     }
