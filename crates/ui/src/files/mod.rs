@@ -56,6 +56,83 @@ pub(super) fn path_is_outside(path: &str) -> bool {
     path.starts_with('/')
 }
 
+fn search_mode_chip(
+    theme: &crate::theme::Theme,
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    handler: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(8.0))
+        .flex_none()
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .when(active, |element| element.bg(crate::theme::wash(0.14)))
+        .when(!active, |element| {
+            element.hover(|style| style.bg(crate::theme::wash(0.08)))
+        })
+        .on_click(handler)
+        .text_size(px(10.0))
+        .font_family(theme.font_sans.clone())
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .child(label)
+        .into_any_element()
+}
+
+fn search_mode_icon_chip(
+    theme: &crate::theme::Theme,
+    id: &'static str,
+    aria_label: &'static str,
+    tooltip: &'static str,
+    icon: &'static str,
+    active: bool,
+    handler: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(8.0))
+        .flex_none()
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .role(gpui::Role::Button)
+        .aria_label(aria_label)
+        .when(active, |element| element.bg(crate::theme::wash(0.14)))
+        .when(!active, |element| {
+            element.hover(|style| style.bg(crate::theme::wash(0.08)))
+        })
+        .on_click(handler)
+        .tooltip(move |_, cx| {
+            cx.new(|_| preview::FileEditorTooltip {
+                text: tooltip.into(),
+            })
+            .into()
+        })
+        .tooltip_show_delay(Duration::from_millis(350))
+        .child(
+            crate::icons::icon(icon)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(if active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+        )
+        .into_any_element()
+}
+
 pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -180,6 +257,30 @@ pub(crate) fn workspace_path_drag_ghost(
     cx.new(|_| WorkspacePathDragGhost { payload })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFileRequest {
+    pub path: String,
+    pub location: Option<OpenFileLocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenFileColumnUnit {
+    /// Transcript/workspace links (`#L12C5`): columns are 1-based.
+    #[default]
+    OneBasedLink,
+    /// Content-search RPC: UTF-32 scalar offsets from the start of the line.
+    Utf32ScalarOffset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFileLocation {
+    pub line: u32,
+    pub match_start_column: u32,
+    pub match_end_column: u32,
+    pub match_text: String,
+    pub column_unit: OpenFileColumnUnit,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilesEvent {
     AddToChat {
@@ -192,7 +293,7 @@ pub enum FilesEvent {
         path: Option<String>,
     },
     Mutate(mutations::MutationIntent),
-    OpenFile(String),
+    OpenFile(OpenFileRequest),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
     TitleChanged,
@@ -292,6 +393,9 @@ pub struct FilesSurface {
     preview: FilePreviewState,
     tree_context_menu: crate::popover::Popup<context_menu::TreeContextMenu>,
     pending_line_navigation: Option<(u32, Option<u32>)>,
+    pending_line_column_unit: OpenFileColumnUnit,
+    pending_line_selection: Option<(u32, u32)>,
+    pending_line_match_text: Option<String>,
     line_navigation_generation: u64,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
@@ -678,6 +782,9 @@ impl FilesSurface {
             ),
             tree_context_menu: crate::popover::Popup::default(),
             pending_line_navigation: None,
+            pending_line_column_unit: OpenFileColumnUnit::default(),
+            pending_line_selection: None,
+            pending_line_match_text: None,
             line_navigation_generation: 0,
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
@@ -918,8 +1025,21 @@ impl FilesSurface {
         self.editor_path.as_deref()
     }
 
-    pub(super) fn open_tree_file(&mut self, path: String, cx: &mut Context<Self>) {
-        cx.emit(FilesEvent::OpenFile(path));
+    pub(super) fn open_tree_file(
+        &mut self,
+        path: String,
+        location: Option<OpenFileLocation>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(FilesEvent::OpenFile(OpenFileRequest { path, location }));
+    }
+
+    pub(super) fn clear_pending_line_navigation(&mut self) {
+        self.pending_line_navigation = None;
+        self.pending_line_selection = None;
+        self.pending_line_match_text = None;
+        self.pending_line_column_unit = OpenFileColumnUnit::default();
+        self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
     }
 
     pub(crate) fn focus_explorer(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1139,8 +1259,7 @@ impl FilesSurface {
         self.tree_context_menu = crate::popover::Popup::default();
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
-        self.pending_line_navigation = None;
-        self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
+        self.clear_pending_line_navigation();
         self.tree.reset();
         self.selected_editor_path = None;
         self.cancel_reveal();
@@ -1202,6 +1321,8 @@ impl FilesSurface {
     ) -> gpui::AnyElement {
         use gpui::Focusable;
         let include_ignored = self.tree.include_ignored();
+        let search_kind = self.search_state.kind;
+        let content_mode = self.search_state.content_mode;
         let search_focus = self.search.focus_handle(cx);
         toolbar(theme)
             .id("files-explorer-header")
@@ -1237,6 +1358,52 @@ impl FilesSurface {
                             .overflow_hidden()
                             .child(self.search.clone()),
                     ),
+            )
+            .child(search_mode_chip(
+                theme,
+                "files-search-kind-files",
+                "Files",
+                search_kind == search::ExplorerSearchKind::Files,
+                cx.listener(|this, _, _, cx| {
+                    this.set_explorer_search_kind(search::ExplorerSearchKind::Files, cx);
+                }),
+            ))
+            .child(search_mode_chip(
+                theme,
+                "files-search-kind-contents",
+                "Contents",
+                search_kind == search::ExplorerSearchKind::Contents,
+                cx.listener(|this, _, _, cx| {
+                    this.set_explorer_search_kind(search::ExplorerSearchKind::Contents, cx);
+                }),
+            ))
+            .when(
+                search_kind == search::ExplorerSearchKind::Contents,
+                |element| {
+                    element
+                        .child(search_mode_icon_chip(
+                            theme,
+                            "files-content-mode-literal",
+                            "Literal",
+                            "Literal match",
+                            crate::icons::MATCH_LITERAL,
+                            content_mode == search::ContentMatchMode::Literal,
+                            cx.listener(|this, _, _, cx| {
+                                this.set_content_match_mode(search::ContentMatchMode::Literal, cx);
+                            }),
+                        ))
+                        .child(search_mode_icon_chip(
+                            theme,
+                            "files-content-mode-fuzzy",
+                            "Fuzzy",
+                            "Fuzzy match",
+                            crate::icons::MAGIC_STICK_3,
+                            content_mode == search::ContentMatchMode::Fuzzy,
+                            cx.listener(|this, _, _, cx| {
+                                this.set_content_match_mode(search::ContentMatchMode::Fuzzy, cx);
+                            }),
+                        ))
+                },
             )
             .child(
                 toolbar_button(
@@ -1347,14 +1514,15 @@ mod explorer_tests {
         let emitted = paths.clone();
         let _sub = cx.update(|cx| {
             cx.subscribe(&surface, move |_, event, _| {
-                if let FilesEvent::OpenFile(path) = event {
+                if let FilesEvent::OpenFile(request) = event {
+                    let path = request.path.clone();
                     emitted.borrow_mut().push(path.clone());
                 }
             })
         });
         surface.update(cx, |surface, cx| {
-            surface.open_tree_file("src/main.rs".into(), cx);
-            surface.open_tree_file("README.md".into(), cx);
+            surface.open_tree_file("src/main.rs".into(), None, cx);
+            surface.open_tree_file("README.md".into(), None, cx);
             assert_eq!(surface.presentation, FilesPresentation::Explorer);
             assert!(surface.editor_path.is_none());
             assert!(!surface.preview.has_active());

@@ -149,6 +149,8 @@ icon_assets![
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
     (LOGOUT_2, "logout-2"),
     (MAGNIFER, "magnifer"),
+    // Paired quotation marks — exact / literal content match in the Files search bar.
+    (MATCH_LITERAL, "match-literal"),
     // Compact magnifier with a distinct handle, matching the linear icon family.
     (PALETTE_SEARCH, "palette-search"),
     (COMMAND, "command"),

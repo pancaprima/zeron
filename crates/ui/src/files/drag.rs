@@ -453,7 +453,10 @@ mod tests {
             events
                 .borrow()
                 .iter()
-                .any(|event| matches!(event,FilesEvent::OpenFile(path) if path=="a.txt"))
+                .any(|event| matches!(
+                    event,
+                    FilesEvent::OpenFile(request) if request.path == "a.txt"
+                ))
         );
         cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(

@@ -107,6 +107,45 @@ async fn workspace_file_rpcs_list_search_read_write_and_watch() {
         .expect("search");
     assert_eq!(matches[0]["path"], "src/lib.rs");
 
+    std::fs::write(repo.join("src/needle.txt"), "find the needle here\n").unwrap();
+    let content = client
+        .call(
+            methods::SEARCH_WORKSPACE_CONTENT,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "query": "needle",
+                "matchMode": "literal",
+            }),
+        )
+        .await
+        .expect("content search");
+    assert_eq!(content["matches"][0]["path"], "src/needle.txt");
+    assert_eq!(content["matches"][0]["line"], 1);
+    assert!(content["matches"][0]["preview"]
+        .as_str()
+        .unwrap()
+        .contains("needle"));
+    std::fs::write(repo.join("binary-tail.txt"), b"needle\n\x00\n").unwrap();
+    let tail = client
+        .call(
+            methods::SEARCH_WORKSPACE_CONTENT,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "query": "needle",
+                "matchMode": "literal",
+            }),
+        )
+        .await
+        .expect("binary tail search");
+    assert!(
+        tail["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "binary-tail.txt")
+    );
+    assert!(tail["skippedBinary"].as_u64().unwrap_or(0) >= 1);
+
     let read = client
         .call(
             methods::READ_WORKSPACE_FILE,

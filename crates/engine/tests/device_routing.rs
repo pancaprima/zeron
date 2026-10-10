@@ -1890,6 +1890,19 @@ async fn workspace_entry_mutations_are_forwarded_to_the_owning_plain_folder() {
         std::fs::read_to_string(folder.join("renamed.txt")).unwrap(),
         "host only"
     );
+    let content = client
+        .call(
+            methods::SEARCH_WORKSPACE_CONTENT,
+            serde_json::json!({
+                "spaceId": "mutation-space",
+                "targetDeviceId": "mutation-host",
+                "query": "host",
+                "matchMode": "literal",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content["matches"][0]["path"], "renamed.txt");
     let deleted=client.call(methods::DELETE_WORKSPACE_ENTRY,serde_json::json!({
         "spaceId":"mutation-space","targetDeviceId":"mutation-host","operationId":"remote-delete",
         "expectedCheckoutId":page["checkoutId"],"path":"renamed.txt",

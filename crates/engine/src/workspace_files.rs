@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
+    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceContentRequest,
+    SearchWorkspaceContentResponse, SearchWorkspaceFilesRequest, WatchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
     WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
     WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
@@ -427,6 +428,35 @@ impl WorkspaceFiles {
         })
         .await
         .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?;
+        cancel_on_drop.disarm();
+        result
+    }
+
+    pub async fn search_content(
+        &self,
+        request: SearchWorkspaceContentRequest,
+    ) -> Result<SearchWorkspaceContentResponse, WorkspaceFilesError> {
+        validate_workspace_search_query(&request.query)?;
+        let workspace = self.resolve_target(&request.target).await?;
+        let limit =
+            usize::from(request.limit.unwrap_or(MAX_SEARCH_RESULTS as u16)).min(MAX_SEARCH_RESULTS);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let match_mode = request.match_mode;
+        let query = request.query.clone();
+        let include_ignored = request.include_ignored;
+        let result = tokio::task::spawn_blocking(move || {
+            crate::workspace_content_search::search_workspace_content_blocking(
+                &workspace.root,
+                &query,
+                match_mode,
+                include_ignored,
+                limit,
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|error| WorkspaceFilesError::Io(format!("content search worker failed: {error}")))?;
         cancel_on_drop.disarm();
         result
     }
@@ -991,7 +1021,7 @@ fn normalize_watch_path_including_temp(root: &Path, path: &Path) -> Option<Strin
     path_to_wire(relative).ok()
 }
 
-fn is_internal_temp_wire_path(path: &str) -> bool {
+pub(crate) fn is_internal_temp_wire_path(path: &str) -> bool {
     path.rsplit('/')
         .next()
         .is_some_and(|name| name.starts_with(".zeron-save-") && name.ends_with(".tmp"))
@@ -1268,7 +1298,7 @@ fn search_workspace_blocking(
     Ok(matches)
 }
 
-fn validate_workspace_search_query(query: &str) -> Result<(), WorkspaceFilesError> {
+pub(crate) fn validate_workspace_search_query(query: &str) -> Result<(), WorkspaceFilesError> {
     if query.trim().is_empty() {
         return Err(WorkspaceFilesError::BadParams(
             "query must not be empty".into(),
@@ -1582,6 +1612,14 @@ fn checked_file_metadata(
         ));
     }
     std::fs::symlink_metadata(canonical).map_err(|error| WorkspaceFilesError::Io(error.to_string()))
+}
+
+pub(crate) fn metadata_for_workspace_file(
+    root: &Path,
+    wire_path: &str,
+) -> Result<std::fs::Metadata, WorkspaceFilesError> {
+    let relative = WorkspaceRelativePath::file(wire_path)?;
+    checked_file_metadata(root, &relative)
 }
 
 fn non_text_file(
@@ -2053,13 +2091,13 @@ fn entry_group(kind: WorkspaceEntryKind) -> u8 {
     }
 }
 
-fn contains_git_component(path: &Path) -> bool {
+pub(crate) fn contains_git_component(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(component, Component::Normal(value) if value.to_string_lossy().eq_ignore_ascii_case(".git"))
     })
 }
 
-fn path_to_wire(path: &Path) -> Result<String, WorkspaceFilesError> {
+pub(crate) fn path_to_wire(path: &Path) -> Result<String, WorkspaceFilesError> {
     path.components()
         .map(|component| match component {
             Component::Normal(value) => value

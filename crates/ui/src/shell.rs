@@ -3673,9 +3673,15 @@ impl Shell {
     }
 
     /// Open or focus a session-owned editor tab. The explorer is independent.
-    fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_file_surface(
+        &mut self,
+        path: String,
+        location: Option<crate::files::OpenFileLocation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let owner = (self.active_chat.clone(), self.state.clone());
-        self.add_file_surface_at(owner, path, None, window, cx);
+        self.add_file_surface_at(owner, path, location, window, cx);
     }
 
     /// The chat and state a transcript link resolves in: the main chat's, or
@@ -3696,7 +3702,7 @@ impl Shell {
         &mut self,
         owner: (String, Entity<AppState>),
         path: String,
-        location: Option<(u32, Option<u32>)>,
+        location: Option<crate::files::OpenFileLocation>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3710,10 +3716,10 @@ impl Shell {
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
-            if let Some((line, column)) = location
+            if let Some(loc) = location
                 && let Some(file) = self.file_surfaces.get(&id).cloned()
             {
-                file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+                file.update(cx, |file, cx| file.apply_open_file_location(loc, cx));
             }
             self.focus_right_file_editor(surface, window, cx);
             return;
@@ -3775,9 +3781,15 @@ impl Shell {
                         this.start_file_mutation(source.clone(), intent.clone(), cx)
                     }
                     // Navigation from an editor stays in its own chat.
-                    FilesEvent::OpenFile(path) => {
+                    FilesEvent::OpenFile(request) => {
                         let owner = (source.read(cx).chat_id().to_owned(), owner_state.clone());
-                        this.add_file_surface_at(owner, path.clone(), None, window, cx)
+                        this.add_file_surface_at(
+                            owner,
+                            request.path.clone(),
+                            request.location.clone(),
+                            window,
+                            cx,
+                        );
                     }
                     FilesEvent::RevealFile(path) => {
                         this.add_files_surface(window, cx);
@@ -3830,10 +3842,10 @@ impl Shell {
             RightSurface::File(id),
         );
         self.set_right_active(RightSurface::File(id), cx);
-        if let Some((line, column)) = location
+        if let Some(loc) = location
             && let Some(file) = self.file_surfaces.get(&id).cloned()
         {
-            file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+            file.update(cx, |file, cx| file.apply_open_file_location(loc, cx));
         }
     }
 
@@ -3898,7 +3910,16 @@ impl Shell {
         self.add_file_surface_at(
             owner,
             link.path,
-            link.line.map(|line| (line, link.column)),
+            link.line.map(|line| {
+                let column = link.column.unwrap_or(0);
+                crate::files::OpenFileLocation {
+                    line,
+                    match_start_column: column,
+                    match_end_column: column.saturating_add(1),
+                    match_text: String::new(),
+                    column_unit: crate::files::OpenFileColumnUnit::OneBasedLink,
+                }
+            }),
             window,
             cx,
         );
@@ -3971,7 +3992,7 @@ impl Shell {
                         this.add_commit_diff_surface(commit.clone(), window, cx);
                     }
                     ChangesEvent::OpenFile(path) => {
-                        this.add_file_surface(path.clone(), window, cx);
+                        this.add_file_surface(path.clone(), None, window, cx);
                     }
                     ChangesEvent::DiscardWorkingTree(request) => {
                         if this.discard_working_tree_task.is_none() {
@@ -14623,13 +14644,13 @@ mod tests {
 
                 shell.add_browser_surface(None, window, cx);
                 let recent = RightSurface::Browser(shell.browser_seq);
-                shell.add_file_surface("README.md".into(), window, cx);
+                shell.add_file_surface("README.md".into(), None, window, cx);
                 let file = RightSurface::File(shell.file_surface_seq);
                 shell.close_right_surface(file, window, cx);
                 assert_eq!(shell.resolved_right_active(cx), recent);
 
                 // A save may complete after switching to another session.
-                shell.add_file_surface("README.md".into(), window, cx);
+                shell.add_file_surface("README.md".into(), None, window, cx);
                 let file = RightSurface::File(shell.file_surface_seq);
                 let owner = shell.panel_key(cx);
                 shell.active_chat = "other".into();
@@ -16240,7 +16261,7 @@ mod exit_regressions {
                     .state
                     .update(cx, |state, _| state.selected_chat = Some("owner".into()));
                 shell.add_files_surface(window, cx);
-                shell.add_file_surface("README.md".into(), window, cx);
+                shell.add_file_surface("README.md".into(), None, window, cx);
                 [
                     shell.files[&shell.panel_key(cx)].clone(),
                     shell.file_surfaces[&shell.file_surface_seq].clone(),
