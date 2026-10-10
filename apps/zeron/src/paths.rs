@@ -30,8 +30,8 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
     #[cfg(not(windows))]
     {
         let home = PathBuf::from(env("HOME").expect("HOME not set"));
-        let dir = home.join(".zeron");
-        // One-shot 0.2.0 migration: adopt the pre-rename data dir.
+        let dir = zeron_update::unix_data_root(&home);
+        // One-shot 0.2.0 migration: adopt the pre-rename data dir into the new default.
         if !dir.exists() {
             let old = home.join(".comet-native");
             if old.exists() && std::fs::rename(&old, &dir).is_ok() {
@@ -45,6 +45,7 @@ fn resolve_data_dir(mut env: impl FnMut(&str) -> Option<OsString>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn resolve(vars: &[(&str, &str)]) -> PathBuf {
         resolve_data_dir(|name| {
@@ -59,6 +60,43 @@ mod tests {
         assert_eq!(
             resolve(&[("ZERON_DATA_DIR", "custom data")]),
             PathBuf::from("custom data")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_data_dir_falls_back_to_zeron_when_zerona_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".zeron")).unwrap();
+        assert_eq!(
+            resolve(&[("HOME", home.to_str().unwrap())]),
+            home.join(".zeron")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_data_dir_prefers_zerona_when_both_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".zeron")).unwrap();
+        fs::create_dir_all(home.join(".zerona")).unwrap();
+        assert_eq!(
+            resolve(&[("HOME", home.to_str().unwrap())]),
+            home.join(".zerona")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_default_data_dir_is_zerona_for_new_installs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(
+            resolve(&[("HOME", home.to_str().unwrap())]),
+            home.join(".zerona")
         );
     }
 
