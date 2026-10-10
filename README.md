@@ -13,7 +13,7 @@ This repository is a **fork** of [zeronsh/zeron](https://github.com/zeronsh/zero
 
 ## Desktop app
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/pancaprima/zeron/releases/latest):
+Download the latest release for your platform from [GitHub Releases](https://github.com/pancaprima/zerona/releases/latest):
 
 - **macOS** — `zeron-<version>-macos-arm64.dmg`
 - **Windows** — `zeron-<version>-windows-x86_64-setup.exe`

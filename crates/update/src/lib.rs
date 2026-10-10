@@ -317,11 +317,11 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
 /// The project's GitHub releases page — the advisory update strip opens this
 /// for unmanaged installs (source builds, hand-copied binaries), where no
 /// updater flow exists to drive.
-pub const RELEASES_PAGE: &str = "https://github.com/pancaprima/zeron/releases";
+pub const RELEASES_PAGE: &str = "https://github.com/pancaprima/zerona/releases";
 
 /// The newest release's page — the download destination offered when this
 /// installation cannot replace itself.
-pub const LATEST_RELEASE_PAGE: &str = "https://github.com/pancaprima/zeron/releases/latest";
+pub const LATEST_RELEASE_PAGE: &str = "https://github.com/pancaprima/zerona/releases/latest";
 
 /// User-level systemd unit for the headless engine (matches `apps/zeron` daemon install).
 pub const SYSTEMD_SERVICE_NAME: &str = "zerona.service";

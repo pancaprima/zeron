@@ -88,3 +88,10 @@ Langkah:
 5. Rename repo ke `pancaprima/zerona` SETELAH rilis terpasang dan stabil (GitHub redirect URL lama, tapi URL feed di env
    sebaiknya diperbarui ke nama baru).
 Rollback: tag/rilis bisa dihapus; service lama tetap utuh karena data dir tidak dipindah.
+
+## Hasil Fase B (10 Okt 2026)
+- Rilis v0.2.108 sukses (Linux x86/arm, macOS, Windows); sha256 tarball cocok dengan manifest.
+- VPS: backup `/root/backups/zeron-data-*.tgz`, binary 0.2.108 terpasang, `zerona.service` aktif, `zeron.service` disabled.
+  Device-id tetap, `Mode: synced`, data dir tetap `~/.zeron` (fallback berjalan).
+- Updater: `ZERON_RELEASES_URL=https://github.com/pancaprima/zerona/releases/latest/download` di `~/.zeron/env`.
+- Repo GitHub di-rename ke `pancaprima/zerona`; URL di kode/README diperbarui lewat PR chore/repo-url-zerona (tidak perlu rilis baru, GitHub redirect URL lama).
