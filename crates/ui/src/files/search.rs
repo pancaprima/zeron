@@ -11,6 +11,7 @@ use super::{
 use crate::{
     file_icons::{self, FileIconIdentity},
     icons::{self, icon},
+    loaders,
     theme::Theme,
 };
 use gpui::{
@@ -282,6 +283,15 @@ impl RevealIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum ContentSearchPhase {
+    #[default]
+    Idle,
+    Debouncing,
+    Searching,
+    Done,
+}
+
 #[derive(Default)]
 pub(super) struct FileSearchState {
     pub query: String,
@@ -291,6 +301,7 @@ pub(super) struct FileSearchState {
     pub content_results: Vec<WorkspaceContentSearchMatch>,
     pub content_completion: Option<WorkspaceContentSearchCompletion>,
     pub content_incomplete_reason: Option<WorkspaceContentSearchIncompleteReason>,
+    pub content_phase: ContentSearchPhase,
     pub loading: bool,
     pub error: Option<SharedString>,
     pub generation: u64,
@@ -305,6 +316,19 @@ pub(super) struct FileSearchState {
 }
 
 impl FileSearchState {
+    /// Clear contents-search UI state when a new non-empty query starts (before RPC/debounce).
+    pub(super) fn begin_content_search_query(&mut self) {
+        self.content_results.clear();
+        self.results.clear();
+        self.tree.clear();
+        self.content_completion = None;
+        self.content_incomplete_reason = None;
+        self.pending_open_location = None;
+        self.content_phase = ContentSearchPhase::Debouncing;
+        self.loading = true;
+        self.error = None;
+    }
+
     fn accepts(&self, generation: u64, query: &str) -> bool {
         self.generation == generation && self.query == query
     }
@@ -325,6 +349,7 @@ impl FileSearchState {
         self.content_results.clear();
         self.content_completion = None;
         self.content_incomplete_reason = None;
+        self.content_phase = ContentSearchPhase::Idle;
         self.pending_open_location = None;
         self.tree.clear();
     }
@@ -369,10 +394,17 @@ impl FilesSurface {
         self.search_state.generation = self.search_state.generation.wrapping_add(1);
         self.search_state.query = query.clone();
         self.search_state.active = 0;
-        self.search_state.error = None;
         self.search_state.task = None;
+        let kind = self.search_state.kind;
+        if !query.is_empty() && kind == ExplorerSearchKind::Contents {
+            self.search_state.begin_content_search_query();
+            self.search_list.reset(0);
+        } else {
+            self.search_state.error = None;
+        }
         if query.is_empty() {
             self.search_state.loading = false;
+            self.search_state.content_phase = ContentSearchPhase::Idle;
             self.search_state.results.clear();
             self.search_state.content_results.clear();
             self.search_state.content_completion = None;
@@ -393,27 +425,48 @@ impl FilesSurface {
             search.set_mention_controls(true, false, cx)
         });
         let Some(context) = self.request_context.clone() else {
-            self.search_state.loading = false;
+            if kind == ExplorerSearchKind::Contents {
+                self.search_state.loading = false;
+                self.search_state.content_phase = ContentSearchPhase::Done;
+            } else {
+                self.search_state.loading = false;
+            }
             self.search_state.error = Some("No workspace available for this chat.".into());
             cx.notify();
             return;
         };
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.search_state.loading = false;
+            if kind == ExplorerSearchKind::Contents {
+                self.search_state.loading = false;
+                self.search_state.content_phase = ContentSearchPhase::Done;
+            } else {
+                self.search_state.loading = false;
+            }
             self.search_state.error = Some("Workspace service is still starting.".into());
             cx.notify();
             return;
         };
-        self.search_state.loading = true;
+        if kind != ExplorerSearchKind::Contents {
+            self.search_state.error = None;
+            self.search_state.loading = true;
+        }
         let generation = self.search_state.generation;
         let include_ignored = self.tree.include_ignored();
-        let kind = self.search_state.kind;
         let content_mode = self.search_state.content_mode;
         let client = WorkspaceFilesClient::new(engine, context.clone());
         self.search_state.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(200))
                 .await;
+            let _ = this.update(cx, |surface, cx| {
+                if surface.search_state.accepts(generation, &query)
+                    && surface.search_state.kind == ExplorerSearchKind::Contents
+                    && kind == ExplorerSearchKind::Contents
+                {
+                    surface.search_state.content_phase = ContentSearchPhase::Searching;
+                    cx.notify();
+                }
+            });
             let result = match kind {
                 ExplorerSearchKind::Files => client
                     .search(SearchWorkspaceFilesRequest {
@@ -446,6 +499,9 @@ impl FilesSurface {
                     return;
                 }
                 surface.search_state.loading = false;
+                if surface.search_state.kind == ExplorerSearchKind::Contents {
+                    surface.search_state.content_phase = ContentSearchPhase::Done;
+                }
                 match result {
                     Ok(SearchResponse::Files(results)) => {
                         surface.search_state.error = None;
@@ -779,13 +835,22 @@ impl FilesSurface {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(error) = self.search_state.error.clone() {
+            return centered_search_message(error, theme.danger.opacity(0.82));
+        }
+        let loading = self.search_state.loading
+            || matches!(
+                self.search_state.content_phase,
+                ContentSearchPhase::Debouncing | ContentSearchPhase::Searching
+            );
+        if loading {
+            return content_search_loading_spinner(theme, cx);
+        }
         if self.search_state.content_results.is_empty() {
-            let label = if self.search_state.loading {
-                "Searching…"
-            } else {
-                "No content matches found."
-            };
-            return centered_search_message(label.into(), theme.text_faint);
+            return centered_search_message(
+                "No content matches found.".into(),
+                theme.text_faint,
+            );
         }
         let status = content_search_status_message(
             self.search_state.content_completion,
@@ -1082,6 +1147,31 @@ fn render_preview_highlights(
         .into_any_element()
 }
 
+fn content_search_loading_spinner(theme: &Theme, cx: &mut Context<FilesSurface>) -> AnyElement {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0))
+        .child(
+            loaders::mini_glyph_spinner(
+                "content-search-spinner",
+                2.0,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            ),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(theme.text_faint)
+                .child("Searching…"),
+        )
+        .into_any_element()
+}
+
 fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyElement {
     div()
         .flex_1()
@@ -1172,6 +1262,59 @@ mod tests {
         });
         state.invalidate();
         assert!(state.pending_open_location.is_none());
+    }
+
+    #[test]
+    fn content_search_clears_results_when_query_changes() {
+        let mut state = FileSearchState::default();
+        state.kind = ExplorerSearchKind::Contents;
+        state.content_results.push(WorkspaceContentSearchMatch {
+            path: "a.txt".into(),
+            line: 1,
+            preview: "old".into(),
+            preview_highlights: Vec::new(),
+            line_match_start: 0,
+            line_match_end: 1,
+            match_text: "old".into(),
+            score: None,
+        });
+        state.pending_open_location = Some(OpenFileLocation {
+            line: 1,
+            match_start_column: 0,
+            match_end_column: 1,
+            match_text: "old".into(),
+            column_unit: OpenFileColumnUnit::Utf32ScalarOffset,
+        });
+        state.content_phase = ContentSearchPhase::Done;
+        state.begin_content_search_query();
+        assert!(state.content_results.is_empty());
+        assert!(state.results.is_empty());
+        assert_eq!(state.tree.rows().len(), 0);
+        assert!(state.pending_open_location.is_none());
+        assert_eq!(state.content_phase, ContentSearchPhase::Debouncing);
+        assert!(state.loading);
+    }
+
+    #[test]
+    fn content_search_spinner_uses_compact_glyph_loader() {
+        // Spot-check contract with `loaders::mini_glyph_spinner(key, cell_px, ...)`.
+        const CONTENT_SEARCH_SPINNER_CELL_PX: f32 = 2.0;
+        assert_eq!(CONTENT_SEARCH_SPINNER_CELL_PX, 2.0);
+    }
+
+    #[test]
+    fn content_search_loading_distinguishes_empty_and_searching() {
+        let mut state = FileSearchState::default();
+        state.kind = ExplorerSearchKind::Contents;
+        state.loading = true;
+        state.content_phase = ContentSearchPhase::Searching;
+        assert!(state.content_results.is_empty());
+        assert!(state.loading || state.content_phase == ContentSearchPhase::Searching);
+
+        state.loading = false;
+        state.content_phase = ContentSearchPhase::Done;
+        assert!(!state.loading);
+        assert_ne!(state.content_phase, ContentSearchPhase::Searching);
     }
 
     #[test]

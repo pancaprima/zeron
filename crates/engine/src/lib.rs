@@ -43,7 +43,8 @@ mod transcript_history;
 pub mod uploads;
 pub mod voice;
 pub mod workspace_files;
-mod workspace_content_search;
+pub mod workspace_content_search;
+pub mod workspace_content_index;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -259,8 +260,15 @@ impl EngineCore {
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
-        let workspace_files =
-            WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
+        let content_index = workspace_content_index::ContentIndexManager::new(
+            profile.store_root().join("content-index"),
+        );
+        let workspace_files = WorkspaceFiles::new(
+            repos.clone(),
+            workspace.clone(),
+            device_id.clone(),
+            content_index,
+        );
         let terminals = Terminals::new();
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
