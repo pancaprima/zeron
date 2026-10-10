@@ -249,12 +249,23 @@ fn render_systemd_unit(
     unit
 }
 
+/// systemd `%h` plus a path relative to the user's home, or an absolute path if outside home.
+fn systemd_home_relative(path: &Path, home: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "%h".to_string(),
+        Ok(rest) => {
+            let rest = rest.to_string_lossy();
+            format!("%h/{}", rest.trim_start_matches('/'))
+        }
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 fn environment_file_line(data_dir: &Path, home: &Path) -> String {
-    let suffix = data_dir
-        .strip_prefix(home)
-        .map(|rest| rest.to_string_lossy())
-        .unwrap_or_else(|| data_dir.to_string_lossy());
-    format!("EnvironmentFile=-%h{suffix}/env")
+    format!(
+        "EnvironmentFile=-{}/env",
+        systemd_home_relative(data_dir, home)
+    )
 }
 
 /// The ExecStart binary path. An exe under `~/…/app/` came from the curl|sh
@@ -281,12 +292,9 @@ fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
         } else {
             home.join(".zeron")
         };
-        let suffix = data_root
-            .strip_prefix(home)
-            .map(|rest| rest.to_string_lossy())
-            .unwrap_or_else(|| data_root.to_string_lossy());
         format!(
-            "%h{suffix}/app/current/{}",
+            "{}/app/current/{}",
+            systemd_home_relative(&data_root, home),
             zeron_update::MANAGED_BINARY_NAME
         )
     } else {
@@ -411,6 +419,20 @@ fn run_quiet(program: &str, args: &[&str]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn systemd_home_relative_paths() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            systemd_home_relative(&home.join(".zerona"), home),
+            "%h/.zerona"
+        );
+        assert_eq!(
+            systemd_home_relative(Path::new("/var/lib/zerona"), home),
+            "/var/lib/zerona"
+        );
+        assert_eq!(systemd_home_relative(home, home), "%h");
+    }
 
     #[test]
     fn systemd_unit_name_is_zerona() {
