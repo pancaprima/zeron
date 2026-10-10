@@ -87,6 +87,52 @@ fn search_mode_chip(
         .into_any_element()
 }
 
+fn search_mode_icon_chip(
+    theme: &crate::theme::Theme,
+    id: &'static str,
+    aria_label: &'static str,
+    tooltip: &'static str,
+    icon: &'static str,
+    active: bool,
+    handler: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .h(px(22.0))
+        .px(px(8.0))
+        .flex_none()
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .role(gpui::Role::Button)
+        .aria_label(aria_label)
+        .when(active, |element| element.bg(crate::theme::wash(0.14)))
+        .when(!active, |element| {
+            element.hover(|style| style.bg(crate::theme::wash(0.08)))
+        })
+        .on_click(handler)
+        .tooltip(move |_, cx| {
+            cx.new(|_| preview::FileEditorTooltip {
+                text: tooltip.into(),
+            })
+            .into()
+        })
+        .tooltip_show_delay(Duration::from_millis(350))
+        .child(
+            crate::icons::icon(icon)
+                .size(px(12.0))
+                .flex_none()
+                .text_color(if active {
+                    theme.text
+                } else {
+                    theme.text_muted
+                }),
+        )
+        .into_any_element()
+}
+
 pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1335,19 +1381,23 @@ impl FilesSurface {
                 search_kind == search::ExplorerSearchKind::Contents,
                 |element| {
                     element
-                        .child(search_mode_chip(
+                        .child(search_mode_icon_chip(
                             theme,
                             "files-content-mode-literal",
                             "Literal",
+                            "Literal match",
+                            crate::icons::MATCH_LITERAL,
                             content_mode == search::ContentMatchMode::Literal,
                             cx.listener(|this, _, _, cx| {
                                 this.set_content_match_mode(search::ContentMatchMode::Literal, cx);
                             }),
                         ))
-                        .child(search_mode_chip(
+                        .child(search_mode_icon_chip(
                             theme,
                             "files-content-mode-fuzzy",
                             "Fuzzy",
+                            "Fuzzy match",
+                            crate::icons::MAGIC_STICK_3,
                             content_mode == search::ContentMatchMode::Fuzzy,
                             cx.listener(|this, _, _, cx| {
                                 this.set_content_match_mode(search::ContentMatchMode::Fuzzy, cx);
