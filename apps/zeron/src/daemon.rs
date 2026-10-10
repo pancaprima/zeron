@@ -13,9 +13,9 @@ use std::process::Command;
 use anyhow::{Context, bail};
 
 const LAUNCHD_LABEL: &str = "sh.zeron.app";
-/// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
-/// `zeron daemon …` manages that installation rather than a competing copy.
-const SYSTEMD_UNIT: &str = "zeron.service";
+/// Same unit name the fork's `zeron daemon install` writes (upstream installer
+/// still uses `zeron.service` until migrated).
+const SYSTEMD_UNIT: &str = zeron_update::SYSTEMD_SERVICE_NAME;
 
 /// Environment captured into the unit file. `PATH` is always included (the
 /// engine spawns harness CLIs like `claude`, which service managers' minimal
@@ -59,7 +59,10 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
+        std::fs::write(
+            &unit,
+            render_systemd_unit(&exe, &env, data_dir, home_dir()?),
+        )?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -224,9 +227,14 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
-fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
+fn render_systemd_unit(
+    exe: &Path,
+    env: &[(String, String)],
+    data_dir: &Path,
+    home: PathBuf,
+) -> String {
     let mut unit = String::from(
-        "[Unit]\nDescription=Zeron headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
+        "[Unit]\nDescription=Zerona headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.
@@ -234,26 +242,53 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.zeron/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\n{}\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe, &home),
+        environment_file_line(data_dir, &home),
     ));
     unit
 }
 
-/// The ExecStart binary path. An exe under `~/.zeron/app/` came from the
-/// curl|sh installer, whose upgrades relink `app/current` — point the unit at
-/// the symlink (as the installer's own unit does) so it never pins one version.
+fn environment_file_line(data_dir: &Path, home: &Path) -> String {
+    let suffix = data_dir
+        .strip_prefix(home)
+        .map(|rest| rest.to_string_lossy())
+        .unwrap_or_else(|| data_dir.to_string_lossy());
+    format!("EnvironmentFile=-%h{suffix}/env")
+}
+
+/// The ExecStart binary path. An exe under `~/…/app/` came from the curl|sh
+/// installer, whose upgrades relink `app/current` — point the unit at the
+/// symlink (as the installer's own unit does) so it never pins one version.
 /// (`current_exe` resolves symlinks, so the versioned dir is what we see here.)
-fn systemd_exec_path(exe: &Path) -> String {
-    exec_path_for(exe, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+fn systemd_exec_path(exe: &Path, home: &Path) -> String {
+    exec_path_for(exe, Some(home))
 }
 
 fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
-    let installed = home
-        .map(|home| home.join(".zeron/app"))
-        .is_some_and(|app_root| exe.starts_with(app_root));
+    let installed = home.is_some_and(|home| {
+        [
+            zeron_update::managed_app_root(home),
+            home.join(".zeron").join("app"),
+        ]
+        .iter()
+        .any(|app_root| exe.starts_with(app_root))
+    });
     if installed {
-        "%h/.zeron/app/current/zeron".to_string()
+        let home = home.expect("home required for managed install path");
+        let data_root = if exe.starts_with(zeron_update::managed_app_root(home)) {
+            zeron_update::unix_data_root(home)
+        } else {
+            home.join(".zeron")
+        };
+        let suffix = data_root
+            .strip_prefix(home)
+            .map(|rest| rest.to_string_lossy())
+            .unwrap_or_else(|| data_root.to_string_lossy());
+        format!(
+            "%h{suffix}/app/current/{}",
+            zeron_update::MANAGED_BINARY_NAME
+        )
     } else {
         format!("{}", exe.display())
     }
@@ -378,7 +413,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn systemd_unit_name_is_zerona() {
+        assert_eq!(SYSTEMD_UNIT, "zerona.service");
+    }
+
+    #[test]
     fn systemd_unit_shape() {
+        let home = PathBuf::from("/home/u");
         let unit = render_systemd_unit(
             Path::new("/usr/local/bin/zeron"),
             &[
@@ -386,6 +427,8 @@ mod tests {
                 ("ZERON_EDGE_URL".into(), "https://edge.example".into()),
                 ("RUST_LOG".into(), "info,zeron=\"debug\"".into()),
             ],
+            &home.join(".zerona"),
+            home,
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/zeron headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
@@ -397,8 +440,21 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("session.json"));
         assert!(!unit.contains("ConditionPathExists"));
-        assert!(unit.contains("EnvironmentFile=-%h/.zeron/env"));
+        assert!(unit.contains("EnvironmentFile=-%h/.zerona/env"));
         assert!(unit.contains("WantedBy=default.target"));
+        assert!(unit.contains("Description=Zerona headless engine"));
+    }
+
+    #[test]
+    fn systemd_unit_uses_legacy_env_file_when_data_dir_is_zeron() {
+        let home = PathBuf::from("/home/u");
+        let unit = render_systemd_unit(
+            Path::new("/usr/local/bin/zeron"),
+            &[],
+            &home.join(".zeron"),
+            home,
+        );
+        assert!(unit.contains("EnvironmentFile=-%h/.zeron/env"));
     }
 
     #[test]
@@ -417,6 +473,13 @@ mod tests {
     fn installed_exe_uses_the_current_symlink() {
         // Installer-managed binary (current_exe resolves the `current` symlink to
         // the versioned dir): the unit must point back at the symlink.
+        assert_eq!(
+            exec_path_for(
+                Path::new("/home/u/.zerona/app/0.3.0/zeron"),
+                Some(Path::new("/home/u")),
+            ),
+            "%h/.zerona/app/current/zeron"
+        );
         assert_eq!(
             exec_path_for(
                 Path::new("/home/u/.zeron/app/0.3.0/zeron"),
@@ -439,7 +502,7 @@ mod tests {
         let plist = render_launchd_plist(
             Path::new("/Users/x/zeron & co/zeron"),
             &[("ZERON_EDGE_URL".into(), "https://e?a=1&b=2".into())],
-            Path::new("/Users/x/.zeron/daemon.log"),
+            Path::new("/Users/x/.zerona/daemon.log"),
         );
         assert!(plist.contains("<key>Label</key><string>sh.zeron.app</string>"));
         // XML-escaped exe path and env value.
@@ -448,7 +511,8 @@ mod tests {
         assert!(plist.contains("<string>headless</string>"));
         assert!(plist.contains("<key>SuccessfulExit</key><false/>"));
         assert!(
-            plist.contains("<key>StandardOutPath</key><string>/Users/x/.zeron/daemon.log</string>")
+            plist
+                .contains("<key>StandardOutPath</key><string>/Users/x/.zerona/daemon.log</string>")
         );
     }
 }

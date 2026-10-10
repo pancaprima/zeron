@@ -317,11 +317,36 @@ fn validate_release_override(value: &str) -> anyhow::Result<String> {
 /// The project's GitHub releases page — the advisory update strip opens this
 /// for unmanaged installs (source builds, hand-copied binaries), where no
 /// updater flow exists to drive.
-pub const RELEASES_PAGE: &str = "https://github.com/zeronsh/zeron/releases";
+pub const RELEASES_PAGE: &str = "https://github.com/pancaprima/zeron/releases";
 
 /// The newest release's page — the download destination offered when this
 /// installation cannot replace itself.
-pub const LATEST_RELEASE_PAGE: &str = "https://github.com/zeronsh/zeron/releases/latest";
+pub const LATEST_RELEASE_PAGE: &str = "https://github.com/pancaprima/zeron/releases/latest";
+
+/// User-level systemd unit for the headless engine (matches `apps/zeron` daemon install).
+pub const SYSTEMD_SERVICE_NAME: &str = "zerona.service";
+
+/// Managed-install binary name on disk (`app/<ver>/zeron` behind `current`).
+pub const MANAGED_BINARY_NAME: &str = "zeron";
+
+/// Unix data directory: prefer `~/.zerona`, fall back to `~/.zeron` when only the
+/// legacy path exists. Never moves data between them.
+pub fn unix_data_root(home: &Path) -> PathBuf {
+    let zerona = home.join(".zerona");
+    if zerona.exists() {
+        return zerona;
+    }
+    let zeron = home.join(".zeron");
+    if zeron.exists() {
+        return zeron;
+    }
+    zerona
+}
+
+/// `unix_data_root(home)/app` — versioned installs and the `current` symlink.
+pub fn managed_app_root(home: &Path) -> PathBuf {
+    unix_data_root(home).join("app")
+}
 
 fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Ok(url) = std::env::var("ZERON_RELEASES_URL")
@@ -459,7 +484,7 @@ impl InstallKind {
                     .context("staged install has no version directory")?;
                 apply_headless(app_root, version)?;
                 if relaunch {
-                    let binary = app_root.join("current").join("zeron");
+                    let binary = app_root.join("current").join(MANAGED_BINARY_NAME);
                     relaunch_after_exit(&binary, Path::new(""));
                 }
                 Ok(())
@@ -537,9 +562,10 @@ fn detect_install_from_for_os(exe: &Path, home: Option<&Path>, os: &str) -> Inst
     }
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".zeron").join("app");
-        if exe.starts_with(&app_root) {
-            return InstallKind::Managed { app_root };
+        for app_root in [managed_app_root(home), home.join(".zeron").join("app")] {
+            if exe.starts_with(&app_root) {
+                return InstallKind::Managed { app_root };
+            }
         }
     }
     for ancestor in exe.ancestors() {
@@ -671,8 +697,8 @@ async fn verify_staged_binary(binary: &Path, version: &str) -> anyhow::Result<()
     .with_context(|| format!("running {} --version", binary.display()))?;
     let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     anyhow::ensure!(
-        output.status.success() && reported == format!("zeron {version}"),
-        "staged binary reported {reported:?} (exit {}), expected \"zeron {version}\"",
+        output.status.success() && reported == format!("{MANAGED_BINARY_NAME} {version}"),
+        "staged binary reported {reported:?} (exit {}), expected \"{MANAGED_BINARY_NAME} {version}\"",
         output.status
     );
     Ok(())
@@ -697,7 +723,7 @@ pub async fn stage_headless(
         "invalid release version {version:?}"
     );
     let dest = app_root.join(version);
-    if dest.join("zeron").exists() {
+    if dest.join(MANAGED_BINARY_NAME).exists() {
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -721,14 +747,14 @@ pub async fn stage_headless(
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("zeron").is_file() {
-            bail!("tarball {file} did not contain a zeron binary");
+        if !unpacked.join(MANAGED_BINARY_NAME).is_file() {
+            bail!("tarball {file} did not contain a {MANAGED_BINARY_NAME} binary");
         }
-        verify_staged_binary(&unpacked.join("zeron"), version).await?;
+        verify_staged_binary(&unpacked.join(MANAGED_BINARY_NAME), version).await?;
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("zeron").exists() => {}
+            Err(_) if dest.join(MANAGED_BINARY_NAME).exists() => {}
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -746,7 +772,7 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let target = app_root.join(version);
-        if !target.join("zeron").exists() {
+        if !target.join(MANAGED_BINARY_NAME).exists() {
             bail!("{} is not a staged install", target.display());
         }
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
@@ -781,7 +807,10 @@ fn in_zeron_service_cgroup(cgroups: &str) -> bool {
     cgroups
         .lines()
         .filter_map(|line| line.rsplit(':').next())
-        .any(|path| path.split('/').any(|part| part == "zeron.service"))
+        .any(|path| {
+            path.split('/')
+                .any(|part| part == SYSTEMD_SERVICE_NAME || part == "zeron.service")
+        })
 }
 
 /// Restart the installed engine service (the same units `zeron daemon` and the
@@ -800,7 +829,7 @@ pub fn restart_service() -> anyhow::Result<()> {
     } else {
         run(
             "systemctl",
-            &["--user", "--no-block", "restart", "zeron.service"],
+            &["--user", "--no-block", "restart", SYSTEMD_SERVICE_NAME],
         )
     }
 }
@@ -1624,6 +1653,16 @@ mod tests {
     fn install_kind_detection() {
         assert_eq!(
             detect_install_from_for_os(
+                Path::new("/home/u/.zerona/app/0.1.1/zeron"),
+                Some(Path::new("/home/u")),
+                "linux",
+            ),
+            InstallKind::Managed {
+                app_root: PathBuf::from("/home/u/.zerona/app")
+            }
+        );
+        assert_eq!(
+            detect_install_from_for_os(
                 Path::new("/home/u/.zeron/app/0.1.1/zeron"),
                 Some(Path::new("/home/u")),
                 "linux",
@@ -1753,7 +1792,7 @@ mod tests {
         let app_root = tmp.path().join("app");
         for ver in ["0.1.0", "0.1.1"] {
             std::fs::create_dir_all(app_root.join(ver)).unwrap();
-            std::fs::write(app_root.join(ver).join("zeron"), ver).unwrap();
+            std::fs::write(app_root.join(ver).join(MANAGED_BINARY_NAME), ver).unwrap();
         }
         apply_headless(&app_root, "0.1.0").unwrap();
         assert_eq!(
@@ -1830,17 +1869,31 @@ mod tests {
     #[test]
     fn systemd_service_cgroup_is_recognized() {
         assert!(in_zeron_service_cgroup(
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zeron.service\n"
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zerona.service\n"
         ));
         assert!(in_zeron_service_cgroup(
-            "12:pids:/user.slice/user@1000.service/zeron.service\n1:name=systemd:/x\n"
+            "12:pids:/user.slice/user@1000.service/zerona.service\n1:name=systemd:/x\n"
+        ));
+        assert!(in_zeron_service_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/zeron.service\n"
         ));
         assert!(!in_zeron_service_cgroup(
             "0::/user.slice/user-1000.slice/session-3.scope\n"
         ));
         assert!(!in_zeron_service_cgroup(
-            "0::/user.slice/user@1000.service/app.slice/zeron.service.d\n"
+            "0::/user.slice/user@1000.service/app.slice/zerona.service.d\n"
         ));
+    }
+
+    #[test]
+    fn unix_data_root_prefers_zerona_then_falls_back_to_zeron() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert_eq!(unix_data_root(home), home.join(".zerona"));
+        std::fs::create_dir_all(home.join(".zeron")).unwrap();
+        assert_eq!(unix_data_root(home), home.join(".zeron"));
+        std::fs::create_dir_all(home.join(".zerona")).unwrap();
+        assert_eq!(unix_data_root(home), home.join(".zerona"));
     }
 
     #[test]
@@ -1857,7 +1910,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         std::fs::create_dir_all(app_root.join("0.4.0")).unwrap();
-        std::fs::write(app_root.join("0.4.0").join("zeron"), "").unwrap();
+        std::fs::write(app_root.join("0.4.0").join(MANAGED_BINARY_NAME), "").unwrap();
         let managed = InstallKind::Managed {
             app_root: app_root.clone(),
         };
@@ -1963,8 +2016,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = dir.join("zeron-pkg");
         std::fs::create_dir_all(&root).unwrap();
-        let binary = root.join("zeron");
-        std::fs::write(&binary, format!("#!/bin/sh\necho \"zeron {reported}\"\n")).unwrap();
+        let binary = root.join(MANAGED_BINARY_NAME);
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\necho \"{MANAGED_BINARY_NAME} {reported}\"\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let tarball = dir.join("pkg.tar.gz");
         run(
@@ -2018,6 +2075,6 @@ mod tests {
             .unwrap();
         server.abort();
         assert_eq!(staged, app_root.join("9.9.9"));
-        assert!(staged.join("zeron").is_file());
+        assert!(staged.join(MANAGED_BINARY_NAME).is_file());
     }
 }
