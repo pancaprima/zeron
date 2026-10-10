@@ -69,3 +69,22 @@ Contoh perintah di teks CLI memakai `zeron` (nama binary sebenarnya); nama produ
 Managed install: `<data-root>/app/current/zeron` (data-root = ~/.zerona atau fallback ~/.zeron).
 Tidak menyentuh: script paket, CI, installer upstream, Info.plist, nama artefak rilis.
 Verifikasi: tanpa build workspace/crates/ui; `cargo test -p zeron-update`, `rustfmt --check`, review.
+
+## Fase B1: rilis lewat fork (disetujui user: opsi 1 + rename repo)
+Status: PR #4 sudah MERGED ke main (CI hijau). Temuan saat cek workflow:
+- `release.yml` sudah bikin GitHub Release (tarball + `manifest.json`) saat tag `v<versi>` di-push. Langkah upload ke R2
+  hanya jalan bila `CLOUDFLARE_API_TOKEN` ada; fork tidak punya, jadi otomatis ter-skip (tidak menyentuh bucket upstream).
+- Updater membaca `{edge}/releases` (upstream) KECUALI env `ZERON_RELEASES_URL` diisi (wajib https, tanpa query).
+  Jadi TIDAK perlu ubah kode: cukup isi `ZERON_RELEASES_URL=https://github.com/pancaprima/zeron/releases/latest/download`
+  di file env service (`~/.zeron/env` / `~/.zerona/env`). GitHub me-redirect ke aset `manifest.json` dan tarball.
+- Tag harus sama dengan versi di `Cargo.toml` (sekarang 0.2.107). Naikkan ke 0.2.108 supaya terlihat lebih baru dari binary managed.
+- Build rilis mencakup Linux x86_64/aarch64, macOS, Windows (semua wajib sukses sebelum `publish`). Perkiraan 20-40 menit.
+
+Langkah:
+1. Branch `chore/release-0.2.108`: bump versi workspace di `Cargo.toml` (+ `Cargo.lock`), PR, CI hijau, merge.
+2. Tag `v0.2.108` di main, push tag, pantau `release` workflow sampai `publish` sukses.
+3. Verifikasi aset rilis: tarball Linux x86_64 + `manifest.json` (sha256 cocok).
+4. Lanjut Fase B (backup `~/.zeron`, pasang binary dari rilis, stop zeron.service, enable zerona.service, cek device-id sama).
+5. Rename repo ke `pancaprima/zerona` SETELAH rilis terpasang dan stabil (GitHub redirect URL lama, tapi URL feed di env
+   sebaiknya diperbarui ke nama baru).
+Rollback: tag/rilis bisa dihapus; service lama tetap utuh karena data dir tidak dipindah.
