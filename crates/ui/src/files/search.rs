@@ -1156,7 +1156,7 @@ fn content_search_loading_spinner(theme: &Theme, cx: &mut Context<FilesSurface>)
         .gap(px(8.0))
         .child(
             loaders::mini_glyph_spinner(
-                "content-search-spinner".into(),
+                "content-search-spinner",
                 2.0,
                 theme.glyph,
                 cx.entity_id(),
