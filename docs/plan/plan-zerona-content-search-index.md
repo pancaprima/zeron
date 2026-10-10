@@ -309,7 +309,7 @@ flowchart TB
 | **3** | Indexed search when `Ready` **and** not dirty/resyncing; exhaustive parity tests; benchmark go/no-go | Faster repeat search **if** gate passes |
 | **4** (optional) | FTS/trigram **literal-only** prefilter | Only if Stage 3 gate fails on CPU **and** literal trigram passes exhaustive parity; **never** for fuzzy narrowing |
 
-Rollout default: **flag off** until Stage 3 parity + benchmark gate pass in CI on target profile.
+Rollout default: **index reads on** when `ZERONA_CONTENT_INDEX` is unset; set `0`/`false`/`off`/`no` to disable. Benchmark gate still records go/no-go evidence; speedup is not yet proven.
 
 ---
 
@@ -327,7 +327,7 @@ All thresholds below are **go/no-go proposals** for the target VPS profile (1 
 | **Disk budget** | Total index files (incl. WAL/shm) stay under global cap with LRU | Chronic cap pressure on typical checkout |
 | **RAM** | No OOM; SQLite pragmas keep engine RSS within existing VPS envelope | RSS growth forces swap thrash |
 
-**If no-go:** Keep `ZERONA_CONTENT_INDEX` read path off; retain scanner-only; consider Option D micro-cache only or gated Option A **literal** trigram — not fuzzy narrowing.
+**If no-go:** Set `ZERONA_CONTENT_INDEX=0` (or `false`/`off`/`no`) to force scanner-only reads; consider Option D micro-cache only or gated Option A **literal** trigram — not fuzzy narrowing.
 
 ### Automated (existing commands — from parent plan)
 
@@ -413,7 +413,7 @@ Store logs under e.g. `docs/plan/bench-logs/` or PR description — **do not** a
 
 **None required for planning.** Defaults:
 
-- Option B line store **hypothesis**; bundled SQLite; index under `store_root`; feature flag default **off** until Stage 3 exhaustive parity **and** benchmark **go**.  
+- Option B line store **hypothesis**; bundled SQLite; index under `store_root`; feature flag default **on** (opt-out via `ZERONA_CONTENT_INDEX=0`); speedup unproven until Stage 3 exhaustive parity **and** benchmark **go**.  
 - Optional FTS trigram **literal-only** if gate fails and separate parity passes — not for fuzzy candidate narrowing.
 
 ---
@@ -432,15 +432,15 @@ Implementation status and scanner bugfix history remain in [`plan-zeron-content-
 | Option B line-store writer + blocking worker thread | **Implemented** | `crates/engine/src/workspace_content_index.rs` (`index_worker_blocking`, `ForegroundSearchGuard`) |
 | Writer/reads env gates (`ZERONA_CONTENT_INDEX`, `ZERONA_CONTENT_INDEX_WRITE`) | **Implemented** | `content_index_reads_enabled()`, `content_index_writer_enabled()`, `parse_content_index_env_flag()` |
 | Watch raw dirty (notify callback) + debounced incremental | **Implemented** | `on_raw_fs_activity` in notify callback; bounded coalesced index work queue; per-profile incremental revisions |
-| Indexed read gate (default off) + revision checks | **Implemented** | `can_serve_indexed_read`, post-query revision guard |
+| Indexed read gate (default on, opt-out) + revision checks | **Implemented** | `can_serve_indexed_read`, `parse_content_index_reads_flag`, post-query revision guard |
 | Parity / revision tests | **Run** | `cargo test -p zeron-engine --test content_index` (4 passed, 2026-10-10) |
 | Scanner unit tests | **Run** | `cargo test -p zeron-engine --lib workspace_content_search::` (16 passed) |
 | Benchmark harness | **Env-gated** | `ZERONA_CONTENT_INDEX_BENCH=1` |
 | CI gate | **Added** | `.github/workflows/voice-tests.yml` (`content_index` test target) |
 | UI `files::search` compile/tests on VPS | **Not executed** | Full `zeron-ui` native build not run in this pass (GPUI/OpenSSL deps) |
-| Benchmark go/no-go | **Re-bench required** | Prior ratio≈0.995 used **cargo target tree** fixture (invalid). Harness now builds **1000-file synthetic corpus** under scratch `tempdir_in` when available; re-run `ZERONA_CONTENT_INDEX_BENCH=1` for real numbers — indexed reads remain **off** until go |
+| Benchmark go/no-go | **Not proven** | One local run on an invalid fixture reported ratio≈1.09 (indexed slower than scan); harness now uses **1000-file synthetic corpus** — re-run `ZERONA_CONTENT_INDEX_BENCH=1` for authoritative numbers. **Speedup is not yet proven.** |
 
-Default: **`ZERONA_CONTENT_INDEX` unset → scanner-only reads and no background writer** (use `ZERONA_CONTENT_INDEX_WRITE=1` only for bench/local warmup).
+Default: **`ZERONA_CONTENT_INDEX` unset → indexed reads and background writer on**; set to `0`/`false`/`off`/`no` to disable reads (and writer unless `ZERONA_CONTENT_INDEX_WRITE=1`).
 
 ## Files modified (implementation)
 
