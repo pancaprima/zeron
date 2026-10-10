@@ -335,17 +335,22 @@ enum SearchResponse {
     Contents(zeron_proto::SearchWorkspaceContentResponse),
 }
 
+const CONTENT_SEARCH_UNSUPPORTED: &str =
+    "Content search is not supported on this workspace host. Update the owning device to search file contents.";
+
+fn is_search_workspace_content_unknown_method(message: &str) -> bool {
+    message.contains("unknown method: SearchWorkspaceContent")
+}
+
 fn content_search_error_message(error: FilesClientError) -> SharedString {
-    match &error {
-        FilesClientError::Request(message)
-            if message.contains("unknown method")
-                || message.contains("UnknownMethod")
-                || message.contains("SearchWorkspaceContent") =>
-        {
-            "Content search is not supported on this workspace host. Update the owning device to search file contents.".into()
+    if let FilesClientError::Request(message) = &error {
+        if is_search_workspace_content_unknown_method(message) {
+            return CONTENT_SEARCH_UNSUPPORTED.into();
         }
-        _ => error.to_string().into(),
     }
+    let text = error.to_string();
+    tracing::warn!(error = %text, "workspace content search failed");
+    text.into()
 }
 
 impl FilesSurface {
@@ -1084,10 +1089,17 @@ fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyEleme
         .items_center()
         .justify_center()
         .px(px(24.0))
-        .text_center()
-        .text_size(px(11.5))
-        .text_color(color)
-        .child(message)
+        .min_w_0()
+        .max_w_full()
+        .child(
+            div()
+                .w_full()
+                .text_center()
+                .text_size(px(11.5))
+                .text_color(color)
+                .whitespace_normal()
+                .child(message),
+        )
         .into_any_element()
 }
 
@@ -1109,11 +1121,34 @@ mod tests {
 
     #[test]
     fn content_search_unknown_method_is_explicit() {
-        let message = content_search_error_message(FilesClientError::Request(
-            "unknown method: SearchWorkspaceContent".into(),
-        ));
-        assert!(message.contains("not supported"));
-        assert!(!message.contains("filename"));
+        for raw in [
+            "unknown method: SearchWorkspaceContent",
+            "workspace request failed: unknown method: SearchWorkspaceContent",
+        ] {
+            let message = content_search_error_message(FilesClientError::Request(raw.into()));
+            assert!(message.contains("not supported"));
+            assert!(!message.contains("filename"));
+        }
+    }
+
+    #[test]
+    fn content_search_other_request_errors_keep_raw_text() {
+        let cases = [
+            FilesClientError::Request(
+                "workspace request failed: bad params: invalid SearchWorkspaceContentRequest"
+                    .into(),
+            ),
+            FilesClientError::Request(
+                "workspace request failed: workspace content search timed out".into(),
+            ),
+            FilesClientError::Transport("connection reset".into()),
+        ];
+        for error in cases {
+            let expected = error.to_string();
+            let message = content_search_error_message(error);
+            assert!(!message.contains("not supported"));
+            assert_eq!(message.as_ref(), expected);
+        }
     }
 
     fn search_match(path: &str, kind: WorkspaceEntryKind, score: i64) -> WorkspaceFileSearchMatch {
